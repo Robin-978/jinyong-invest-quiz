@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>你的投資方式是哪個金庸小說主角？</title>
+  <meta name="description" content="匿名小測驗：不收集個資，只統計角色比例。" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <h1>你的投資方式是哪個金庸小說主角？</h1>
+      <p class="subtitle">回答 6 題，看看你的投資江湖路數（匿名，不收集個資）。</p>
+    </header>
+
+    <section id="quiz" class="card"></section>
+
+    <section id="result" class="card hidden">
+      <h2 id="resultTitle"></h2>
+      <p id="resultDesc" class="resultDesc"></p>
+
+      <div class="actions">
+        <button id="btnRestart" class="btn secondary">再玩一次</button>
+        <button id="btnSubmit" class="btn">看看大家都像誰（匿名送出）</button>
+      </div>
+
+      <div id="privacyNote" class="privacyNote">
+        ?? 隱私說明：本測驗不收集任何個人資料。僅統計各角色「累計人數」與「總參與數」，用於呈現整體分布。
+      </div>
+
+      <div id="stats" class="stats hidden">
+        <h3>目前分布</h3>
+        <div id="statsSummary" class="statsSummary"></div>
+        <div id="bars" class="bars"></div>
+        <p id="updatedAt" class="updatedAt"></p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <p>c 匿名互動測驗｜可自由分享</p>
+    </footer>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
