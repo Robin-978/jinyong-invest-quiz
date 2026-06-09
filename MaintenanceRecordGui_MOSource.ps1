@@ -1,4 +1,11 @@
-﻿# PATCH_SUMMARY 2026-06-09 PDF Landscape Orientation
+﻿# PATCH_SUMMARY 2026-06-09 MO Source PDF One-Row-Per-Source Fix
+# - 修正 PDF/Excel 匯出時，MO Source 只有一筆資料會被拆成直向 12 列（一欄一個欄位值）的問題。
+# - 根因：Get-MoSourceRowsForExport 以 ",$rows" 慣用法回傳完整列集合，呼叫端卻又 Get-CollectionItem 0，
+#   反而取到第一列，使單一 source 的 12 欄被當成 12 列輸出。
+# - 修正四處呼叫端，直接使用回傳的列集合，確保「一列代表一個 source、12 欄橫向」。
+# - 不改維修紀錄核心邏輯、欄位、鎖定、稽核與草稿資料結構。
+
+# PATCH_SUMMARY 2026-06-09 PDF Landscape Orientation
 # - 匯出 PDF 改為橫式 (landscape) 列印，而非直式 (portrait)，讓 12 欄 MO Source 表格完整顯示。
 # - Excel COM 匯出：PageSetup.Orientation 由 1 (xlPortrait) 改為 2 (xlLandscape)，FitToPagesWide 仍為 1。
 # - 影像式 PDF 退回路徑：MediaBox 固定為 792x612 橫式，頁面內容維持原始比例置中，避免拉伸或裁切。
@@ -675,7 +682,7 @@ function Get-RecordsSnapshot {
         [void]$rows.Add((New-SnapshotEntry ("maintenance_log." + ($i + 1)) ((Get-SafeRowCell $logRow 0) + "|" + (Get-SafeRowCell $logRow 1) + "|" + (Get-SafeRowCell $logRow 2))))
     }
     $moRowsWrapper = Get-MoSourceRowsForExport 0
-    $moRows = Get-CollectionItem $moRowsWrapper 0
+    $moRows = $moRowsWrapper
     for ($i = 0; $i -lt (Get-CollectionCount $moRows); $i++) {
         $moRow = Get-CollectionItem $moRows $i
         [void]$rows.Add((New-SnapshotEntry ("mo_source." + ($i + 1)) (Get-MoSourceRowText $moRow)))
@@ -2140,8 +2147,10 @@ function Draw-MoSourcePdfSection {
 
     $moFont = New-Object System.Drawing.Font("Microsoft JhengHei", 5)
     $moHeadFont = New-Object System.Drawing.Font("Microsoft JhengHei", 5.5, [System.Drawing.FontStyle]::Bold)
-    $safeMoRowsWrapper = Get-MoSourceRowsForExport 0
-    $safeMoRows = Get-CollectionItem $safeMoRowsWrapper 0
+    # Get-MoSourceRowsForExport 透過 ",$rows" 已回傳完整列集合（每列 12 欄）。
+    # 不可再 Get-CollectionItem 0，否則只有一筆 source 時會被誤取成第一列，
+    # 導致 12 個欄位被當成 12 列直向輸出。
+    $safeMoRows = Get-MoSourceRowsForExport 0
     $drawRows = New-Object System.Collections.ArrayList
     $startMo = 0
     $maxMo = Get-CollectionCount $safeMoRows
@@ -2675,9 +2684,10 @@ function Write-MaintenancePdfViaExcel {
         $moHeaders = @("Source", "設定瓶壓", "位置", "重量Off", "重量On", "重量T/W", "來料瓶壓", "實際瓶壓", "效率Off", "效率On", "退庫數量", "備註")
         for ($c = 0; $c -lt 12; $c++) { Set-ExcelCell $ws $row ($c + 1) ([string](Get-CollectionItem $moHeaders $c)) $true 8 }
         $row++
-        $excelMoRowsWrapper = Get-MoSourceRowsForExport 5
-        if ($Mode -eq "Full") { $excelMoRowsWrapper = Get-MoSourceRowsForExport 8 }
-        $excelMoRows = Get-CollectionItem $excelMoRowsWrapper 0
+        # Get-MoSourceRowsForExport 已回傳完整列集合（每列代表一個 source、12 欄）。
+        # 直接使用，不可再取 index 0，否則只有一筆 source 時 12 欄會被拆成直向 12 列。
+        $excelMoRows = Get-MoSourceRowsForExport 5
+        if ($Mode -eq "Full") { $excelMoRows = Get-MoSourceRowsForExport 8 }
         for ($i = 0; $i -lt (Get-CollectionCount $excelMoRows); $i++) {
             $moRow = Get-CollectionItem $excelMoRows $i
             for ($c = 0; $c -lt 12; $c++) {
@@ -2734,7 +2744,7 @@ function Write-MaintenancePdf {
 
     $logRows = Normalize-TableRows (Get-GridRows $script:gridMaintenanceLog) 3 0
     $moRowsWrapper = Get-MoSourceRowsForExport 0
-    $moRows = Get-CollectionItem $moRowsWrapper 0
+    $moRows = $moRowsWrapper
     $itemRows = Get-MaintenanceItemRows
 
     try {
