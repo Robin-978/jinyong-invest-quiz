@@ -1,0 +1,160 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0b1220;
+  font-family: "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif;
+  color: #f1f5f9;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+}
+
+/* 前鏡頭畫面：鏡像 + 蓋滿全螢幕 */
+#video {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  filter: brightness(0.75);
+}
+
+#game {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.hidden { display: none !important; }
+
+/* 計分板 */
+#hud {
+  position: fixed;
+  top: env(safe-area-inset-top, 0);
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.hud-item {
+  background: rgba(2, 6, 23, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 16px;
+  backdrop-filter: blur(6px);
+  white-space: nowrap;
+}
+
+.hud-item b { font-size: 20px; }
+
+#hudScore b { color: #4ade80; }
+#hudTime b { color: #fbbf24; }
+#hudCombo { color: #f472b6; font-weight: 700; }
+#hudCombo:empty { display: none; }
+
+/* 覆蓋層（開始 / 結束畫面） */
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(2, 6, 23, 0.78);
+  backdrop-filter: blur(8px);
+  z-index: 10;
+  overflow-y: auto;
+}
+
+.panel {
+  max-width: 440px;
+  width: 100%;
+  text-align: center;
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 20px;
+  padding: 26px 22px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.panel h1 {
+  font-size: 28px;
+  margin-bottom: 12px;
+}
+
+.lead {
+  font-size: 15px;
+  line-height: 1.6;
+  color: #cbd5e1;
+  margin-bottom: 12px;
+}
+
+.rules {
+  text-align: left;
+  list-style: none;
+  margin: 0 auto 14px;
+  max-width: 340px;
+  font-size: 14px;
+  line-height: 1.9;
+  color: #e2e8f0;
+}
+
+/* 水果分數對照表 */
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.legend span {
+  background: rgba(30, 41, 59, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 13px;
+}
+
+.btn {
+  appearance: none;
+  border: 0;
+  border-radius: 14px;
+  padding: 14px 26px;
+  font-size: 18px;
+  font-weight: 700;
+  color: #052e16;
+  background: linear-gradient(135deg, #4ade80, #22d3ee);
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(34, 211, 238, 0.35);
+}
+
+.btn:active { transform: scale(0.97); }
+
+.status {
+  margin-top: 12px;
+  font-size: 13px;
+  color: #94a3b8;
+  min-height: 1.4em;
+}
+
+.final-score {
+  font-size: 20px;
+  margin-bottom: 10px;
+}
+
+.final-score b {
+  font-size: 44px;
+  color: #4ade80;
+}
