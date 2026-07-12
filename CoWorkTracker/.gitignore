@@ -1,0 +1,11 @@
+Data/*.json
+Data/*.json.bak
+Data/master.key
+Logs/log_*.enc
+Logs/log_errors.txt
+Backups/*.zip
+Uploads/**/*
+!Data/.gitkeep
+!Logs/.gitkeep
+!Backups/.gitkeep
+!Uploads/.gitkeep

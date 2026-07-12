@@ -1,0 +1,15 @@
+{
+  "AppName": "CoWorkTracker",
+  "Version": "1.0.0",
+  "DataRoot": "",
+  "DataFolder": "Data",
+  "LogsFolder": "Logs",
+  "BackupsFolder": "Backups",
+  "UploadsFolder": "Uploads",
+  "MasterKeyFile": "Data/master.key",
+  "BackupKeepCount": 30,
+  "PBKDF2Iterations": 100000,
+  "FileLockRetry": 20,
+  "FileLockDelayMs": 150,
+  "AutoBackupOnStart": true
+}
