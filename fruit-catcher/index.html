@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>體感接水果 — 揮手接水果，小心炸彈與榴槤！</title>
+  <meta name="description" content="用手機前鏡頭偵測手部動作的體感網頁遊戲：接住左右飛來的水果得分，水果越大分數越高，碰到炸彈或榴槤會扣分。" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <!-- 前鏡頭畫面（鏡像顯示，當作遊戲背景） -->
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="game"></canvas>
+
+  <!-- 計分板 -->
+  <div id="hud" class="hidden">
+    <div class="hud-item" id="hudScore">分數 <b>0</b></div>
+    <div class="hud-item" id="hudCombo"></div>
+    <div class="hud-item" id="hudTime">⏱ <b>60</b></div>
+  </div>
+
+  <!-- 開始畫面 -->
+  <div id="startOverlay" class="overlay">
+    <div class="panel">
+      <h1>🍉 體感接水果</h1>
+      <p class="lead">用<b>前鏡頭</b>偵測你的手，揮動手掌去接住左右飛來的水果！</p>
+      <ul class="rules">
+        <li>🖐️ 手掌碰到水果就算接到，<b>水果越大、分數越高</b></li>
+        <li>💣 炸彈 <b>−40 分</b>，千萬別碰！</li>
+        <li>🟢 榴槤（綠色刺刺的）<b>−30 分</b>，也別碰！</li>
+        <li>⏱ 一回合 60 秒，挑戰你的最高分</li>
+      </ul>
+      <div class="legend" id="legend"></div>
+      <button id="btnStart" class="btn">📷 開啟鏡頭開始遊戲</button>
+      <p id="status" class="status">需要允許使用相機（畫面只在你的手機上處理，不會上傳）。</p>
+    </div>
+  </div>
+
+  <!-- 結束畫面 -->
+  <div id="endOverlay" class="overlay hidden">
+    <div class="panel">
+      <h1 id="endTitle">時間到！</h1>
+      <p class="final-score">得分 <b id="finalScore">0</b></p>
+      <p id="endComment" class="lead"></p>
+      <p class="lead">🏆 本機最高分：<b id="bestScore">0</b></p>
+      <button id="btnRestart" class="btn">🔁 再玩一次</button>
+    </div>
+  </div>
+
+  <script type="module" src="./game.js"></script>
+</body>
+</html>
