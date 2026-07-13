@@ -25,6 +25,17 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.6  效能/修正: 去識別化轉換 (RawImport -> Import) 大幅加速並確保對照表落地 —
+          (1) Get-DeidentAlias 類別編號改用計數快取 (原版每新增一個 alias 即全表
+              掃描, 數萬個新 ID 為 O(n^2), 大檔需數十分鐘 -> 數秒);
+          (2) Convert-RawImportFile 輸出改 StringBuilder + 行內 CSV 跳脫
+              (移除陣列 += 與逐儲存格函式呼叫);
+          (3) Add-LinesSafe 改批次附加 (原版逐行 Add-Content 每行開關檔案);
+          (4) 寫檔順序修正: 先寫 DeidentMap.csv 對照表、再寫去識別化輸出檔,
+              且對照表檔一定會建立 — 修正中途中斷時「有輸出檔、無對照表」
+              導致 alias 無法回溯的問題;
+          (5) 設定頁轉換按鈕執行中顯示等待游標, 完成訊息含耗時;
+          SelfTest 增至 93 項 (編號接續、重複轉換不重複建檔、輸出一致)。
    1.0.5  效能: 前 Run Log 診斷 / StepCode 平均計算大幅加速 (大檔由 20+ 分鐘降至數秒) —
           (1) Get-StepCodeMeanTable 改用內嵌 C# 串流彙總引擎 (Add-Type, 離線編譯,
               免安裝; 逐字元 CSV 解析, 支援引號欄位), 取代 Import-Csv + 逐儲存格
@@ -86,7 +97,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.5"
+$script:AIVersion = "1.0.6"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -373,7 +384,10 @@ function Add-LinesSafe {
             if ($existing.Length -gt 0 -and -not $existing.EndsWith("`n")) {
                 [System.IO.File]::AppendAllText($tmp, [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
             }
-            foreach ($line in $Lines) { Add-Content -LiteralPath $tmp -Value $line -Encoding UTF8 }
+            # v1.0.6: 批次一次附加 (原版逐行 Add-Content 每行開關檔案, 數萬行極慢)
+            $sbApp = New-Object System.Text.StringBuilder
+            foreach ($line in $Lines) { [void]$sbApp.Append($line); [void]$sbApp.Append([Environment]::NewLine) }
+            [System.IO.File]::AppendAllText($tmp, $sbApp.ToString(), (New-Object System.Text.UTF8Encoding($false)))
             Move-Item -LiteralPath $tmp -Destination $Path -Force
         } catch {
             $pname = "{0}_{1}.pending.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"), ([System.Guid]::NewGuid().ToString("N").Substring(0, 8))
@@ -669,20 +683,40 @@ function Get-DeidentAlias {
       取得或新建 alias; State.NewRows 為 hashtable 回寫槽 (Pitfall 7.5)。
       Category 一律用 Prefix (如 PF / TOOL), 使 ProductID 與 PrevProductID
       等不同欄位共用同一別名空間: 同一原始值必得同一 alias, 不同值必不撞名。
+      v1.0.6 效能: 類別既有數量改用 State.Counters 快取 (首次使用該類別時
+      掃描一次, 之後 O(1) 遞增)。原版每新增一個 alias 即全表掃描, 大檔
+      (數萬個新 RunID/LotID) 為 O(n^2), 是轉換耗時數十分鐘的主因。
+      編號結果與原版完全相同。
     #>
     param([hashtable]$Map, [string]$Category, [string]$RawValue, [string]$Prefix, [hashtable]$State)
     $key = $Category + "|" + $RawValue
     if ($Map.ContainsKey($key)) { return [string]$Map[$key] }
-    $count = 1
-    foreach ($k in $Map.Keys) {
-        if ($k.StartsWith($Category + "|")) { $count++ }
+
+    if (-not $State.ContainsKey("Counters")) { $State["Counters"] = @{} }
+    $counters = $State["Counters"]
+    if (-not $counters.ContainsKey($Category)) {
+        $cnt = 0
+        $catPrefix = $Category + "|"
+        foreach ($k in $Map.Keys) { if ($k.StartsWith($catPrefix)) { $cnt++ } }
+        $counters[$Category] = $cnt
+    }
+    $count = [int]$counters[$Category] + 1
+    $counters[$Category] = $count
+
+    if (-not $State.ContainsKey("Stamp")) {
+        $State["Stamp"] = @{
+            Date = (Get-Date -Format "yyyyMMdd")
+            Time = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        }
     }
     $alias = "{0}_{1:D3}" -f $Prefix, $count
     if ($Category -eq "RUN") {
-        $alias = "RUN_{0}_{1:D3}" -f (Get-Date -Format "yyyyMMdd"), $count
+        $alias = "RUN_{0}_{1:D3}" -f ([string]$State["Stamp"].Date), $count
     }
     $Map[$key] = $alias
-    $State.NewRows += ,(Join-CsvLine @($Category, $RawValue, $alias, (Get-Date -Format "yyyy-MM-dd HH:mm:ss")))
+    $newRow = Join-CsvLine @($Category, $RawValue, $alias, [string]$State["Stamp"].Time)
+    if ($State.NewRows -is [System.Collections.Generic.List[string]]) { [void]$State.NewRows.Add($newRow) }
+    else { $State.NewRows += ,$newRow }
     return $alias
 }
 
@@ -697,50 +731,67 @@ function Convert-RawImportFile {
     $rows = Import-CsvSafe -Path $RawPath
     if ($rows.Count -eq 0) { throw ("RawImport 檔案無資料: " + $RawPath) }
     $map = Import-DeidentMap -MapPath $MapPath
-    $mapState = @{ NewRows = @() }
+    $mapState = @{ NewRows = (New-Object System.Collections.Generic.List[string]); Counters = @{} }
 
     $first = $rows[0]
     $rawCols = @()
     foreach ($p in $first.PSObject.Properties) { $rawCols += $p.Name }
 
+    # 以欄位「位置」對應規則 (Import-Csv 每列屬性順序與標頭一致)
     $outCols = @()
-    $ruleByCol = @{}
-    foreach ($c in $rawCols) {
+    $ruleByIdx = @{}
+    for ($i = 0; $i -lt $rawCols.Count; $i++) {
         $matched = $null
         foreach ($rule in $script:DeidentColumnRules) {
-            if ($rule.RawColumn -eq $c) { $matched = $rule; break }
+            if ($rule.RawColumn -eq $rawCols[$i]) { $matched = $rule; break }
         }
         if ($null -ne $matched) {
-            $ruleByCol[$c] = $matched
+            $ruleByIdx[$i] = $matched
             $outCols += $matched.AliasColumn
         } else {
-            $outCols += $c
+            $outCols += $rawCols[$i]
         }
     }
 
-    $lines = @()
-    $lines += (Join-CsvLine $outCols)
+    # v1.0.6: StringBuilder + 行內 CSV 跳脫。原版以陣列 += 累積輸出行 (O(n^2)
+    # 複製) 且每儲存格經 2~3 層函式呼叫, 大檔需數十分鐘; 改寫後為數秒。
+    $nl = [Environment]::NewLine
+    $sbOut = New-Object System.Text.StringBuilder
+    [void]$sbOut.Append((Join-CsvLine $outCols))
     foreach ($r in $rows) {
-        $vals = @()
-        foreach ($c in $rawCols) {
-            $v = Get-FieldString -Object $r -PropertyName $c
-            if ($ruleByCol.ContainsKey($c) -and -not [string]::IsNullOrEmpty($v)) {
-                $rule = $ruleByCol[$c]
-                $v = Get-DeidentAlias -Map $map -Category $rule.Prefix -RawValue $v -Prefix $rule.Prefix -State $mapState
+        [void]$sbOut.Append($nl)
+        $i = 0
+        foreach ($p in $r.PSObject.Properties) {
+            if ($i -gt 0) { [void]$sbOut.Append(',') }
+            $v = [string]$p.Value
+            if ($v.Length -gt 0) { $v = $v.Trim() }
+            if ($v.Length -gt 0 -and $ruleByIdx.ContainsKey($i)) {
+                $rule = $ruleByIdx[$i]
+                # 已有 alias 直接查表 (免函式呼叫); 僅新值才進 Get-DeidentAlias
+                $mk = ([string]$rule.Prefix) + "|" + $v
+                if ($map.ContainsKey($mk)) { $v = [string]$map[$mk] }
+                else { $v = Get-DeidentAlias -Map $map -Category $rule.Prefix -RawValue $v -Prefix $rule.Prefix -State $mapState }
             }
-            $vals += $v
+            # 行內跳脫, 規則與 ConvertTo-CsvValue 相同 (避免逐儲存格函式呼叫)
+            if ($v.IndexOf(',') -ge 0 -or $v.IndexOf('"') -ge 0 -or $v.IndexOf("`r") -ge 0 -or $v.IndexOf("`n") -ge 0) {
+                $v = '"' + $v.Replace('"', '""') + '"'
+            }
+            [void]$sbOut.Append($v)
+            $i++
         }
-        $lines += (Join-CsvLine $vals)
     }
-    Write-FileSafe -Path $OutPath -Text ($lines -join [Environment]::NewLine)
 
+    # v1.0.6 順序修正: 先落地對照表、再寫去識別化輸出檔 —
+    # 原版順序相反, 中途中斷會產生「有輸出檔、無對照表」而使 alias 無法回溯;
+    # 且對照表檔一律建立 (即使本次無新 alias), 便於確認去識別化已受控留存。
+    if (-not (Test-Path -LiteralPath $MapPath)) {
+        Write-FileSafe -Path $MapPath -Text "Category,RawValue,Alias,CreatedAt"
+    }
     if ($mapState.NewRows.Count -gt 0) {
-        if (-not (Test-Path -LiteralPath $MapPath)) {
-            Write-FileSafe -Path $MapPath -Text "Category,RawValue,Alias,CreatedAt"
-        }
         Add-LinesSafe -Path $MapPath -Lines $mapState.NewRows
     }
-    return $lines.Count - 1
+    Write-FileSafe -Path $OutPath -Text $sbOut.ToString()
+    return $rows.Count
 }
 
 function Convert-AllRawImports {
@@ -2290,6 +2341,19 @@ function Invoke-SelfTest {
     $a1 = Get-DeidentAlias -Map $map2 -Category "TOOL" -RawValue "MOCVD-A7" -Prefix "TOOL" -State $st
     $a2 = Get-DeidentAlias -Map $map2 -Category "TOOL" -RawValue "MOCVD-A7" -Prefix "TOOL" -State $st
     & $assert ($a1 -eq $a2 -and $st.NewRows.Count -eq 0) "對照表: 同值同 alias, 不重複建檔"
+
+    # --- 8b. 去識別化效能修正 (v1.0.6) 行為驗證 ---
+    # 計數快取的編號需與原版全表掃描結果相同: 新值接續既有編號
+    $st2 = @{ NewRows = @() }
+    $a3 = Get-DeidentAlias -Map $map2 -Category "TOOL" -RawValue "MOCVD-B9" -Prefix "TOOL" -State $st2
+    & $assert ($a3 -eq "TOOL_002" -and $st2.NewRows.Count -eq 1) "對照表: 新值編號接續既有 (TOOL_002)"
+    # 重複轉換: 同值同 alias, 對照表不增列, 輸出內容完全一致
+    $mapRowsBefore = @(Import-CsvSafe -Path $script:DeidentMapPath).Count
+    $n2 = Convert-RawImportFile -RawPath $rawCsv -OutPath $outCsv -MapPath $script:DeidentMapPath
+    $outText2 = Read-AllTextUtf8 -Path $outCsv
+    $mapRowsAfter = @(Import-CsvSafe -Path $script:DeidentMapPath).Count
+    & $assert ($n2 -eq 2 -and $mapRowsAfter -eq $mapRowsBefore) "去識別化: 重複轉換不重複建檔"
+    & $assert ($outText2 -eq $outText) "去識別化: 重複轉換輸出一致"
     Remove-Item -LiteralPath $outCsv -Force -ErrorAction SilentlyContinue
 
     # --- 9. 端到端: 建立 Import 範例 -> Invoke-RunDiagnosis -> 報告 ---
@@ -3454,9 +3518,17 @@ function Build-SettingsTab {
             if ($null -eq $u -or (Get-FieldString -Object $u -PropertyName "Role") -ne "Admin") {
                 Show-Warn "僅管理員 (Admin) 可執行去識別化轉換。"; return
             }
-            $results = @(Convert-AllRawImports)
+            # v1.0.6: 執行中顯示等待游標, 完成訊息含耗時
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
+            try {
+                $results = @(Convert-AllRawImports)
+            } finally {
+                [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
+            }
+            $sw.Stop()
             if ($results.Count -eq 0) { Show-Info ("RawImport 資料夾內無 CSV 檔:" + [Environment]::NewLine + (Get-RawImportRootPath)); return }
-            Show-Info ("轉換完成:" + [Environment]::NewLine + ($results -join [Environment]::NewLine))
+            Show-Info (("轉換完成 (耗時 {0} 秒):" -f [math]::Round($sw.Elapsed.TotalSeconds, 1)) + [Environment]::NewLine + ($results -join [Environment]::NewLine))
         } catch {
             Write-ErrorLog ("btnDeident: " + $_.Exception.Message)
             Show-ErrorMessage ("去識別化轉換失敗: " + $_.Exception.Message)
@@ -3627,7 +3699,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.5
+# EOF RunPreCheckAI.ps1 v1.0.6
 
 
 
