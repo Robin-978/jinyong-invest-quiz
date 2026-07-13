@@ -25,6 +25,22 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.10 新增: 資料表自動補列 (Update-DerivedTables) — 回應「資料表都只有
+          表頭」回饋:
+          (1) RunSummary 由 Log 檔名目錄自動補列 (RunID_Alias/ToolAlias/
+              ProductFamily/PreviousProductFamily/RunStartTime=檔案時間);
+              MeasurementTrend 由量測總檔自動補列 (RunDate/PL 偏移);
+              僅新增缺少的 RunID_Alias 列, 人工維護列一律不動;
+              啟動與「重載資料」時自動執行;
+          (2) 診斷整合與資料來源解耦: Run 已建入 RunSummary 後, 秒級 Log
+              比對與量測總檔整合仍自動執行 (原本僅檔名模式才有);
+              「由 Log 檔名建立」註記僅在 RunSummary 查無該 Run 時出現;
+          (3) Run 下拉選單顯示「Run 碼 | 產品」(表格與檔名目錄一致),
+              同一 Run 不重複列出;
+          (4) ToolStability / Maintenance / HistoryCases 之 alarm / PM /
+              案例資料不在 Log 或量測檔內, 仍需 MES 匯出或人工維護
+              (未填時該面向依既有規則保守呈現), 欄位說明檔已註明;
+          SelfTest 增至 113 項。
    1.0.9  修正/新增 (依現場回饋):
           (1) 修正 PS 5.1 StrictMode 下去識別化轉換報「找不到屬性 'Count'」—
               Import-CsvSafe 等函式回傳單列/空集合被解開為純量或 $null,
@@ -137,7 +153,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.9"
+$script:AIVersion = "1.0.10"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -955,6 +971,14 @@ function Initialize-ImportTableTemplates {
             "所有 ID 應為去識別化代號 (可用設定頁 RawImport -> Import 轉換工具產生)。",
             "機台秒級 Log 檔與量測總檔直接放入 Import / RawImport 即可, 不必建表。",
             "",
+            "[自動 vs 手動]",
+            "  自動補列: RunSummary (由 Log 檔名) 與 MeasurementTrend (由量測總檔)",
+            "            於啟動與「重載資料」時自動增列缺少的 Run; 人工維護列不會被覆蓋。",
+            "  自動彙總: ProductDrift 可不填 — 量測總檔存在時系統自動計算飄移。",
+            "  需手動 / MES 匯出: ToolStability (alarm 與穩定度分數)、Maintenance (PM / 換件)、",
+            "            HistoryCases (歷史案例) — 這些資料不在 Log 或量測檔內, 系統無從產生;",
+            "            未填時該面向以「保守中風險 + 資料不足」呈現。",
+            "",
             "[RunSummary.csv] Run 基本資料 (機台/Run 下拉選單來源之一)",
             "  RunID_Alias=Run 代號  ToolAlias=機台代號  ChamberAlias=腔體  ProductFamily=產品族",
             "  RecipeFamily=Recipe 族  RecipeVersionGroup=Recipe 版本群  PreviousProductFamily=前一 Run 產品族",
@@ -1238,6 +1262,85 @@ function Get-MeasurementDriftInfo {
         DriftRow = $row
         ValueSummary = ($vals -join "; ")
     }
+}
+
+# ============================================================
+# 資料表自動補列 (v1.0.10)
+# RunSummary / MeasurementTrend 的內容可由 Log 檔名目錄與量測總檔推得,
+# 自動補列缺少的 RunID_Alias (只增列, 人工維護的既有列一律不動)。
+# ToolStability / Maintenance / HistoryCases 之 alarm / PM / 案例資料
+# 不存在於 Log 或量測檔, 需由 MES / 設備系統匯出或人工維護。
+# ============================================================
+function Update-DerivedTables {
+    Initialize-ImportTableTemplates | Out-Null
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+
+    # --- RunSummary: 由 Log 檔名目錄補列 ---
+    $rsPath = Join-Path $script:ImportRoot "RunSummary.csv"
+    $existing = @{}
+    foreach ($r in @(Import-CsvSafe -Path $rsPath)) {
+        $k = Get-FieldString -Object $r -PropertyName "RunID_Alias"
+        if (-not [string]::IsNullOrEmpty($k)) { $existing[$k] = $true }
+    }
+    $cat = @(Get-RunLogCatalog)
+    $cat = @($cat | Sort-Object -Property @{ Expression = { [string]$_.Tool } }, @{ Expression = { [long]$_.RunId } })
+    $rsLines = New-Object System.Collections.Generic.List[string]
+    $prevProdByTool = @{}
+    $rsAdded = 0
+    foreach ($e in $cat) {
+        $tool = [string]$e.Tool
+        $prevProd = ""
+        if ($prevProdByTool.ContainsKey($tool)) { $prevProd = [string]$prevProdByTool[$tool] }
+        $prevProdByTool[$tool] = [string]$e.Product
+        if ($existing.ContainsKey([string]$e.RunId)) { continue }
+        $ts = ""
+        try { $ts = ([System.IO.File]::GetLastWriteTime([string]$e.Path)).ToString("yyyy-MM-dd HH:mm:ss") } catch { }
+        # 欄序: RunID_Alias,ToolAlias,ChamberAlias,ProductFamily,RecipeFamily,RecipeVersionGroup,
+        #       PreviousProductFamily,RunStartTime,RunEndTime,RunResult,OperatorShift,
+        #       RecipeVersionChanged,RecipeChangeNote
+        # RunStartTime 以 Log 檔案時間近似 (僅供排序); RunResult 未知留空 (不臆測)
+        $rsLines.Add((Join-CsvLine @([string]$e.RunId, $tool, "", [string]$e.Product, "", "", $prevProd, $ts, "", "", "", "0", "")))
+        $existing[[string]$e.RunId] = $true
+        $rsAdded++
+    }
+    if ($rsLines.Count -gt 0) {
+        Add-LinesSafe -Path $rsPath -Lines $rsLines
+        Write-AppLog ("RunSummary 自動補列 {0} 筆 (由 Log 檔名目錄)。" -f $rsAdded)
+    }
+
+    # --- MeasurementTrend: 由量測總檔補列 (PL 偏移 = 對前一量測 Run) ---
+    $mtPath = Join-Path $script:ImportRoot "MeasurementTrend.csv"
+    $mtExisting = @{}
+    foreach ($r in @(Import-CsvSafe -Path $mtPath)) {
+        $k = Get-FieldString -Object $r -PropertyName "RunID_Alias"
+        if (-not [string]::IsNullOrEmpty($k)) { $mtExisting[$k] = $true }
+    }
+    $meas = @(Get-MeasurementRunCatalog)
+    $meas = @($meas | Sort-Object -Property @{ Expression = { [int]$_.ToolNum } }, @{ Expression = { [long]$_.RunId } })
+    $mtLines = New-Object System.Collections.Generic.List[string]
+    $prevPlByTool = @{}
+    $mtAdded = 0
+    foreach ($m in $meas) {
+        $toolAlias = "MAT{0:D2}" -f [int]$m.ToolNum
+        $pl = $m.Mean["IGA_WL_AVG"]
+        if ($null -eq $pl) { $pl = $m.Mean["AGA_WL_AVG"] }
+        $shiftTxt = ""
+        if ($prevPlByTool.ContainsKey($toolAlias) -and $null -ne $pl -and $null -ne $prevPlByTool[$toolAlias]) {
+            $shiftTxt = ([double]$pl - [double]$prevPlByTool[$toolAlias]).ToString("0.###", $inv)
+        }
+        $prevPlByTool[$toolAlias] = $pl
+        if ($mtExisting.ContainsKey([string]$m.RunId)) { continue }
+        # 欄序: RunID_Alias,ToolAlias,RunDate,AlarmCount,PLPeakShiftNm,ThicknessDeltaPct
+        $mtLines.Add((Join-CsvLine @([string]$m.RunId, $toolAlias, [string]$m.GDate, "", $shiftTxt, "")))
+        $mtExisting[[string]$m.RunId] = $true
+        $mtAdded++
+    }
+    if ($mtLines.Count -gt 0) {
+        Add-LinesSafe -Path $mtPath -Lines $mtLines
+        Write-AppLog ("MeasurementTrend 自動補列 {0} 筆 (由量測總檔)。" -f $mtAdded)
+    }
+
+    return @{ RunSummaryAdded = $rsAdded; MeasurementTrendAdded = $mtAdded }
 }
 
 # ============================================================
@@ -2339,16 +2442,17 @@ function Invoke-RunDiagnosis {
 
     $runRow = Find-RowByRun -Rows $runRows -RunAlias $RunAlias
 
-    # v1.0.7: RunSummary 查無此 Run 時, 改由機台 Log 檔名目錄建立基本資料
-    # (Input 僅放秒級 Log 檔的情境: 機台/Run/產品 由檔名解析)
+    # v1.0.10: Log 檔名目錄一律查找 (RunSummary 已建檔的 Run 也要保有
+    # 秒級 Log 比對與量測總檔整合); 僅 RunSummary 查無時才以檔名建立基本資料
+    $logCatalog = @(Get-RunLogCatalog)
     $logEntry = $null
-    $logCatalog = @()
+    foreach ($e in $logCatalog) {
+        if ([string]$e.RunId -eq $RunAlias) { $logEntry = $e; break }
+    }
+    $isSyntheticRun = $false
     if ($null -eq $runRow) {
-        $logCatalog = @(Get-RunLogCatalog)
-        foreach ($e in $logCatalog) {
-            if ([string]$e.RunId -eq $RunAlias) { $logEntry = $e; break }
-        }
         if ($null -eq $logEntry) { throw ("找不到 Run 基本資料: " + $RunAlias) }
+        $isSyntheticRun = $true
         $runRow = @{
             RunID_Alias   = $RunAlias
             ToolAlias     = [string]$logEntry.Tool
@@ -2398,7 +2502,8 @@ function Invoke-RunDiagnosis {
     $prevPrevRunAlias = ""
     if ($null -ne $prevPrevRunRow) { $prevPrevRunAlias = Get-FieldString -Object $prevPrevRunRow -PropertyName "RunID_Alias" }
 
-    # v1.0.7: Log 檔名目錄模式 — 以同機台 Run 碼數字排序推得前一 / 上上 Run
+    # v1.0.7/1.0.10: 由 Log 檔名目錄以同機台 Run 碼數字排序推得前一 / 上上 Run
+    # (供秒級 Log 比對用; RunSummary 已推得的前一 Run 不覆蓋, 僅補空)
     $prevLogEntry = $null
     if ($null -ne $logEntry) {
         $thisId = [long]$RunAlias
@@ -2410,9 +2515,11 @@ function Invoke-RunDiagnosis {
         $earlier = @($earlier | Sort-Object -Property @{ Expression = { [long]$_.RunId }; Descending = $true })
         if ($earlier.Count -ge 1) {
             $prevLogEntry = $earlier[0]
-            $prevRunAlias = [string]$earlier[0].RunId
+            if ([string]::IsNullOrEmpty($prevRunAlias)) { $prevRunAlias = [string]$earlier[0].RunId }
         }
-        if ($earlier.Count -ge 2) { $prevPrevRunAlias = [string]$earlier[1].RunId }
+        if ($earlier.Count -ge 2 -and [string]::IsNullOrEmpty($prevPrevRunAlias)) {
+            $prevPrevRunAlias = [string]$earlier[1].RunId
+        }
     }
 
     # 特徵資料:
@@ -2509,12 +2616,14 @@ function Invoke-RunDiagnosis {
         } else {
             $missing.Items += "同機台無更早的 Log 檔, 無法進行本 Run vs 前一 Run 秒級 Log 比對"
         }
-        $missing.Items += "此 Run 由 Log 檔名建立, RunSummary / ToolStability / Maintenance / ProductDrift 尚無對應資料"
+        if ($isSyntheticRun) {
+            $missing.Items += "此 Run 由 Log 檔名建立, RunSummary / ToolStability / Maintenance / ProductDrift 尚無對應資料"
+        }
     }
 
     $overall = @{ Level = (Measure-MaxRisk @($stab.Level, $maint.Level, $drift.Level)); Reasons = @() }
     Get-ContextChecks -RunRow $runRow -Result $overall
-    if ($null -ne $logEntry) {
+    if ($isSyntheticRun) {
         $overall.Reasons += ("(資料來源) 本 Run 資訊由 Log 檔名解析建立 (檔案: {0}); 表格資料備齊前, 缺漏面向以保守等級與 Log 比對呈現。" -f [string]$logEntry.FileName)
     }
 
@@ -3226,6 +3335,23 @@ function Invoke-SelfTest {
         -WarnPct 3.0 -HighPct 8.0 -MinSec 5 -TopN 5 -MinBaseAbs 0.05
     & $assert ($cmpTiny.ComparedCells -eq 0 -and $cmpTiny.Level -eq 0) "LogCmp: 近零基準參數依門檻略過"
 
+    # --- 20. 資料表自動補列 (v1.0.10) ---
+    $upd1 = Update-DerivedTables
+    $rsText = Read-AllTextUtf8 -Path (Join-Path $script:ImportRoot "RunSummary.csv")
+    & $assert ($upd1.RunSummaryAdded -ge 2 -and $rsText.Contains("261175,MAT06,,H01B9N")) "自動補列: RunSummary 由 Log 檔名產生"
+    $mtText = Read-AllTextUtf8 -Path (Join-Path $script:ImportRoot "MeasurementTrend.csv")
+    & $assert ($upd1.MeasurementTrendAdded -ge 2 -and $mtText.Contains("261173,MAT06")) "自動補列: MeasurementTrend 由量測總檔產生"
+    $upd2 = Update-DerivedTables
+    & $assert ($upd2.RunSummaryAdded -eq 0 -and $upd2.MeasurementTrendAdded -eq 0) "自動補列: 重複執行不重複增列"
+
+    # Run 已建入 RunSummary 後, 診斷仍保有 Log 比對與量測總檔整合 (解耦回歸)
+    $dTbl = Invoke-RunDiagnosis -RunAlias "261175"
+    $tblStabText = ($dTbl.Stability.Reasons -join " | ")
+    $tblDriftText = ($dTbl.Drift.Reasons -join " | ")
+    $tblOverallText = ($dTbl.Overall.Reasons -join " | ")
+    & $assert ($tblStabText.Contains("(Log 比對)") -and $tblDriftText.Contains("(量測總檔)") -and `
+               -not $tblOverallText.Contains("由 Log 檔名解析建立")) "自動補列: 建表後診斷仍含 Log 比對與量測整合"
+
     # --- 收尾 ---
     Write-Host ""
     Write-Host ("SelfTest 結果: PASS={0} FAIL={1}" -f $t.Pass, $t.Fail)
@@ -3571,19 +3697,30 @@ function Build-DiagnosisTab {
                 if ((Get-FieldString -Object $r -PropertyName "ToolAlias") -eq $tool) { $toolRuns += $r }
             }
             $sorted = @($toolRuns | Sort-Object -Property @{ Expression = { Get-FieldString -Object $_ -PropertyName "RunStartTime" }; Descending = $true })
+            # v1.0.10: 顯示 "Run碼 | 產品"; 表格與 Log 檔名目錄同 Run 不重複列出
+            $seenRuns = @{}
             foreach ($r in $sorted) {
-                [void]$cbRun.Items.Add((Get-FieldString -Object $r -PropertyName "RunID_Alias"))
+                $rid = Get-FieldString -Object $r -PropertyName "RunID_Alias"
+                if ([string]::IsNullOrEmpty($rid) -or $seenRuns.ContainsKey($rid)) { continue }
+                $seenRuns[$rid] = $true
+                $txt = $rid
+                $pfv = Get-FieldString -Object $r -PropertyName "ProductFamily"
+                if (-not [string]::IsNullOrEmpty($pfv)) { $txt = $rid + " | " + $pfv }
+                [void]$cbRun.Items.Add($txt)
             }
-            # v1.0.7: 併入 Log 檔名目錄的 Run (顯示 "Run碼 | 產品", 新到舊)
+            # v1.0.7: 併入 Log 檔名目錄的 Run (新到舊)
             $cat = @()
             if ($null -ne $St.LogCatalog) { $cat = @($St.LogCatalog) }
             $logRuns = @()
             foreach ($e in $cat) { if ([string]$e.Tool -eq $tool) { $logRuns += $e } }
             $logRuns = @($logRuns | Sort-Object -Property @{ Expression = { [long]$_.RunId }; Descending = $true })
             foreach ($e in $logRuns) {
-                $txt = [string]$e.RunId
-                if (-not [string]::IsNullOrEmpty([string]$e.Product)) { $txt = $txt + " | " + [string]$e.Product }
-                if (-not $cbRun.Items.Contains($txt)) { [void]$cbRun.Items.Add($txt) }
+                $rid = [string]$e.RunId
+                if ($seenRuns.ContainsKey($rid)) { continue }
+                $seenRuns[$rid] = $true
+                $txt = $rid
+                if (-not [string]::IsNullOrEmpty([string]$e.Product)) { $txt = $rid + " | " + [string]$e.Product }
+                [void]$cbRun.Items.Add($txt)
             }
             if ($cbRun.Items.Count -gt 0) { $cbRun.SelectedIndex = 0 }
         } catch {
@@ -3593,6 +3730,8 @@ function Build-DiagnosisTab {
 
     $reloadTools = {
         try {
+            # v1.0.10: 由 Log 檔名目錄 / 量測總檔自動補列 RunSummary / MeasurementTrend
+            try { Update-DerivedTables | Out-Null } catch { Write-ErrorLog ("Update-DerivedTables: " + $_.Exception.Message) }
             $cbTool.Items.Clear()
             $rows = @(Get-DataRows -TableName "RunSummary")
             $seen = @{}
@@ -4356,7 +4495,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.9
+# EOF RunPreCheckAI.ps1 v1.0.10
 
 
 
