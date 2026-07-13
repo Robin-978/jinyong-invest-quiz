@@ -25,6 +25,13 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.11 修正 (依現場回饋): 資料表 RunID_Alias 鍵格式容錯 —
+          工程師於 ToolStability / Maintenance / ProductDrift 填入
+          「機台+Run 碼」(如 MAT06261176) 時, 系統以「Run 碼」(261176)
+          查表對不上, 導致已填資料仍報「無前一 Run 穩定度資料」。
+          Find-RowByRun 增加 ToolAlias 參數, 同時接受: Run 碼、
+          機台+Run 碼、機台_Run 碼、機台-Run 碼 (不分大小寫、去空白);
+          欄位說明檔註明接受格式。SelfTest 增至 117 項。
    1.0.10 新增: 資料表自動補列 (Update-DerivedTables) — 回應「資料表都只有
           表頭」回饋:
           (1) RunSummary 由 Log 檔名目錄自動補列 (RunID_Alias/ToolAlias/
@@ -153,7 +160,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.10"
+$script:AIVersion = "1.0.11"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -968,6 +975,8 @@ function Initialize-ImportTableTemplates {
         $nl = [Environment]::NewLine
         $help = @(
             "資料表欄位說明 (Data\Import\*.csv; 以 RunID_Alias 為鍵, 一列一 Run)",
+            "RunID_Alias 接受「Run 碼」(如 261176) 或「機台+Run 碼」(如 MAT06261176 /",
+            "MAT06_261176 / MAT06-261176), 不分大小寫。",
             "所有 ID 應為去識別化代號 (可用設定頁 RawImport -> Import 轉換工具產生)。",
             "機台秒級 Log 檔與量測總檔直接放入 Import / RawImport 即可, 不必建表。",
             "",
@@ -2127,9 +2136,26 @@ function Get-SqlDataRows {
 }
 
 function Find-RowByRun {
-    param([object[]]$Rows, [string]$RunAlias)
+    <#
+      以 RunID_Alias 查表列。
+      v1.0.11: 傳入 ToolAlias 時容錯 — 工程師常以「機台+Run 碼」填寫
+      (如 MAT06261176), 與系統的「Run 碼」(261176) 同視為相符;
+      接受格式: Run碼 / 機台Run碼 / 機台_Run碼 / 機台-Run碼 (不分大小寫)。
+    #>
+    param([object[]]$Rows, [string]$RunAlias, [string]$ToolAlias = "")
+    if ([string]::IsNullOrEmpty($RunAlias)) { return $null }
+    $ra = $RunAlias.Trim().ToUpper()
+    $keys = New-Object System.Collections.Generic.List[string]
+    [void]$keys.Add($ra)
+    if (-not [string]::IsNullOrEmpty($ToolAlias)) {
+        $ta = $ToolAlias.Trim().ToUpper()
+        [void]$keys.Add($ta + $ra)
+        [void]$keys.Add($ta + "_" + $ra)
+        [void]$keys.Add($ta + "-" + $ra)
+    }
     foreach ($r in $Rows) {
-        if ((Get-FieldString -Object $r -PropertyName "RunID_Alias") -eq $RunAlias) { return $r }
+        $rid = (Get-FieldString -Object $r -PropertyName "RunID_Alias").ToUpper()
+        if ($rid.Length -gt 0 -and $keys.Contains($rid)) { return $r }
     }
     return $null
 }
@@ -2530,22 +2556,22 @@ function Invoke-RunDiagnosis {
     $driftRow = $null
     $driftSourceAlias = ""
     if (-not [string]::IsNullOrEmpty($prevRunAlias)) {
-        $stabRow  = Find-RowByRun -Rows $stabRows  -RunAlias $prevRunAlias
-        $maintRow = Find-RowByRun -Rows $maintRows -RunAlias $prevRunAlias
+        $stabRow  = Find-RowByRun -Rows $stabRows  -RunAlias $prevRunAlias -ToolAlias $toolAlias
+        $maintRow = Find-RowByRun -Rows $maintRows -RunAlias $prevRunAlias -ToolAlias $toolAlias
     }
     if (-not [string]::IsNullOrEmpty($prevPrevRunAlias)) {
-        $driftRow = Find-RowByRun -Rows $driftRows -RunAlias $prevPrevRunAlias
+        $driftRow = Find-RowByRun -Rows $driftRows -RunAlias $prevPrevRunAlias -ToolAlias $toolAlias
         if ($null -ne $driftRow) { $driftSourceAlias = $prevPrevRunAlias }
     }
     if ($null -eq $driftRow -and -not [string]::IsNullOrEmpty($prevRunAlias)) {
         # 若 N-1 量測例外地已產出 (或無 N-2 資料), 退回 N-1
-        $driftRow = Find-RowByRun -Rows $driftRows -RunAlias $prevRunAlias
+        $driftRow = Find-RowByRun -Rows $driftRows -RunAlias $prevRunAlias -ToolAlias $toolAlias
         if ($null -ne $driftRow) { $driftSourceAlias = $prevRunAlias }
     }
-    if ($null -eq $stabRow)  { $stabRow  = Find-RowByRun -Rows $stabRows  -RunAlias $RunAlias }
-    if ($null -eq $maintRow) { $maintRow = Find-RowByRun -Rows $maintRows -RunAlias $RunAlias }
+    if ($null -eq $stabRow)  { $stabRow  = Find-RowByRun -Rows $stabRows  -RunAlias $RunAlias -ToolAlias $toolAlias }
+    if ($null -eq $maintRow) { $maintRow = Find-RowByRun -Rows $maintRows -RunAlias $RunAlias -ToolAlias $toolAlias }
     if ($null -eq $driftRow) {
-        $driftRow = Find-RowByRun -Rows $driftRows -RunAlias $RunAlias
+        $driftRow = Find-RowByRun -Rows $driftRows -RunAlias $RunAlias -ToolAlias $toolAlias
         if ($null -ne $driftRow) { $driftSourceAlias = $RunAlias }
     }
 
@@ -2570,7 +2596,7 @@ function Invoke-RunDiagnosis {
     if (-not [string]::IsNullOrEmpty($prevPrevRunAlias) -and $driftSourceAlias -eq $prevPrevRunAlias) {
         $drift.Reasons += ("(資料時效) 量測資料取自上上 Run {0};上一 Run {1} 之 PL/XRD/Thickness/Rs/AOI 尚未產出, 請搭配「前 Run Log 診斷」確認 N-1 機台行為。" -f $prevPrevRunAlias, $prevRunAlias)
     }
-    if (-not [string]::IsNullOrEmpty($prevPrevRunAlias) -and $null -eq (Find-RowByRun -Rows $driftRows -RunAlias $prevPrevRunAlias)) {
+    if (-not [string]::IsNullOrEmpty($prevPrevRunAlias) -and $null -eq (Find-RowByRun -Rows $driftRows -RunAlias $prevPrevRunAlias -ToolAlias $toolAlias)) {
         $missing.Items += ("缺少上上 Run (N-2) 量測資料 (ProductDrift: " + $prevPrevRunAlias + ")")
     }
 
@@ -3351,6 +3377,26 @@ function Invoke-SelfTest {
     $tblOverallText = ($dTbl.Overall.Reasons -join " | ")
     & $assert ($tblStabText.Contains("(Log 比對)") -and $tblDriftText.Contains("(量測總檔)") -and `
                -not $tblOverallText.Contains("由 Log 檔名解析建立")) "自動補列: 建表後診斷仍含 Log 比對與量測整合"
+
+    # --- 21. RunID_Alias 鍵格式容錯 (v1.0.11): 機台+Run 碼填法 ---
+    $rowFlex = New-TestRow @{ RunID_Alias = "MAT06261176"; ToolAlias = "MAT06"; TempStabilityScore = "90" }
+    & $assert ($null -ne (Find-RowByRun -Rows @($rowFlex) -RunAlias "261176" -ToolAlias "MAT06")) "鍵容錯: 機台+Run 碼可查得"
+    & $assert ($null -eq (Find-RowByRun -Rows @($rowFlex) -RunAlias "261176")) "鍵容錯: 未指定機台時維持嚴格比對"
+
+    # e2e: 重現現場填法 — ToolStability / Maintenance 以 MAT06261174 為鍵
+    Write-AllTextUtf8 -Path (Join-Path $script:ImportRoot "ToolStability.csv") -Text (@(
+        "RunID_Alias,ToolAlias,TempStabilityScore,PressureStabilityScore,MFCStabilityScore,RotationStabilityScore,VacuumRecoveryTimeMin,AlarmCountLastRun,CriticalAlarmCount,InterlockEventCount,CriticalAlarmWithin24h,RecentAlarmCodes",
+        "MAT06261174,MAT06,90,90,90,80,120,0,0,0,0,"
+    ) -join [Environment]::NewLine)
+    Write-AllTextUtf8 -Path (Join-Path $script:ImportRoot "Maintenance.csv") -Text (@(
+        "RunID_Alias,ToolAlias,DaysAfterPM,RunsAfterPM,DaysAfterPartChange,RecentSameAlarmCount7d,MTBFTrend,RecentCorrectiveMaintenance,GoldenRunVerified",
+        "MAT06261174,MAT06,3,10,3,0,Flat,No,NA"
+    ) -join [Environment]::NewLine)
+    $dFlex = Invoke-RunDiagnosis -RunAlias "261175"
+    $flexStab = ($dFlex.Stability.Reasons -join " | ")
+    $flexMaint = ($dFlex.Maintenance.Reasons -join " | ")
+    & $assert ((-not $flexStab.Contains("無前一 Run 穩定度資料")) -and $flexStab.Contains("轉速穩定分數")) "鍵容錯: 穩定度資料以機台+Run 碼查得"
+    & $assert (-not $flexMaint.Contains("無 PM / 維修資料")) "鍵容錯: 維修資料以機台+Run 碼查得"
 
     # --- 收尾 ---
     Write-Host ""
@@ -4495,7 +4541,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.10
+# EOF RunPreCheckAI.ps1 v1.0.11
 
 
 
