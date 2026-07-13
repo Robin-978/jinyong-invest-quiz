@@ -25,6 +25,21 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.9  修正/新增 (依現場回饋):
+          (1) 修正 PS 5.1 StrictMode 下去識別化轉換報「找不到屬性 'Count'」—
+              Import-CsvSafe 等函式回傳單列/空集合被解開為純量或 $null,
+              呼叫端一律以 @() 包裝; 全檔盤點修正 4 處;
+          (2) 去識別化轉換自動略過機台秒級 Log 檔 (MAT 檔名慣例, Log 比對
+              直接讀取免轉換) 與量測總檔 (已為去識別後資料); 單一檔案失敗
+              不中斷其餘檔案, 結果逐檔列出;
+          (3) 啟動時自動建立六張資料表空白範本 (Data\Import, 僅標頭,
+              行為中性) 與 Data\資料表欄位說明.txt, 方便建立
+              RunSummary / ToolStability / Maintenance / ProductDrift /
+              MeasurementTrend / HistoryCases; 既有檔案一律不動;
+          (4) 新增門檻 LogCompareMinBaseAbs (預設 0=不啟用): Log 比對時
+              基準平均絕對值低於此者略過 — 供濾除近零參數 (如 Dop 微量
+              流量) 造成的數千 % 相對差異噪音, 由治理小組視機台調整;
+          SelfTest 增至 109 項。
    1.0.8  新增: 量測總檔 (Measurement Master) 支援 — Import/RawImport 內含
           STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,... 標頭之 CSV/TXT 自動偵測
           (可含表頭說明前言, 自動跳過並定位真實標頭):
@@ -122,7 +137,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.8"
+$script:AIVersion = "1.0.9"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -483,6 +498,7 @@ function Get-DefaultConfig {
             GoldenDeltaHighPct     = 10.0   # N-1 vs Golden |差異%| > 此 -> High
             LogCompareMinSec       = 5      # Step 秒數低於此不列入比對 (避免短 step 噪音)
             LogCompareTopN         = 10     # 報告列出差異最大的前 N 筆
+            LogCompareMinBaseAbs   = 0.0    # Log 比對: 基準平均絕對值低於此者略過 (0=不啟用; 濾近零參數噪音)
             MeasUnifWorsenPct      = 20.0   # 量測總檔: 均勻性 STD 增幅% > 此 -> 趨勢 Worse
             MeasDefectUpPct        = 30.0   # 量測總檔: 缺陷 (LPD3+4/Area_total) 平均增幅% > 此 -> 趨勢 Up
             PLShiftMinNm           = 0.5    # 量測總檔: PL 波長偏移絕對值 >= 此 (nm) 才計入連續偏移
@@ -584,7 +600,7 @@ function Initialize-UsersCsv {
 function Find-UserById {
     param([string]$UserId)
     if ([string]::IsNullOrEmpty($UserId)) { return $null }
-    $rows = Import-CsvSafe -Path $script:UsersPath
+    $rows = @(Import-CsvSafe -Path $script:UsersPath)
     foreach ($u in $rows) {
         $uid = Get-FieldString -Object $u -PropertyName "UserId"
         $act = Get-FieldString -Object $u -PropertyName "IsActive" -DefaultValue "0"
@@ -613,7 +629,7 @@ function Add-UserAccount {
     if ([string]::IsNullOrEmpty($DisplayName)) { $DisplayName = $UserId }
 
     Initialize-UsersCsv
-    $rows = Get-AllUsers
+    $rows = @(Get-AllUsers)
     foreach ($u in $rows) {
         if ((Get-FieldString -Object $u -PropertyName "UserId").ToUpper() -eq $UserId.ToUpper()) {
             throw ("工號 {0} 已存在 (含停用帳號)。" -f $UserId)
@@ -639,7 +655,7 @@ function Add-UserAccount {
 function Set-UserActive {
     # 停用 / 啟用帳號; 保護最後一位可用 Admin 不可停用
     param([string]$UserId, [bool]$Active)
-    $rows = Get-AllUsers
+    $rows = @(Get-AllUsers)
     if ($rows.Count -eq 0) { throw "users.csv 無資料。" }
     $found = $false
     foreach ($u in $rows) {
@@ -757,7 +773,9 @@ function Convert-RawImportFile {
       - 對照表 DeidentMap.csv 僅存本機受控資料夾
     #>
     param([string]$RawPath, [string]$OutPath, [string]$MapPath)
-    $rows = Import-CsvSafe -Path $RawPath
+    # v1.0.9: 必以 @() 包裝 — 單列 CSV 回傳會被解開為單一物件,
+    # PS 5.1 StrictMode 下 .Count 會報「找不到屬性 'Count'」
+    $rows = @(Import-CsvSafe -Path $RawPath)
     if ($rows.Count -eq 0) { throw ("RawImport 檔案無資料: " + $RawPath) }
     $map = Import-DeidentMap -MapPath $MapPath
     $mapState = @{ NewRows = (New-Object System.Collections.Generic.List[string]); Counters = @{} }
@@ -824,15 +842,33 @@ function Convert-RawImportFile {
 }
 
 function Convert-AllRawImports {
-    # 將 Data\RawImport 下所有 CSV 轉換到 Data\Import (同檔名)
+    <#
+      將 Data\RawImport 下的 CSV 轉換到 Data\Import (同檔名)。
+      v1.0.9: 機台秒級 Log 檔 (MAT 檔名慣例; Log 比對直接讀取) 與
+      量測總檔 (依格式定義已為去識別後資料) 不含去識別化規則欄位,
+      自動略過; 單一檔案失敗不中斷其餘檔案, 結果逐檔列出。
+    #>
     $files = @(Get-ChildItem -LiteralPath $script:RawImportRoot -Filter "*.csv" -ErrorAction SilentlyContinue)
     if ($files.Count -eq 0) { return @() }
     $results = @()
     foreach ($f in $files) {
-        $out = Join-Path $script:ImportRoot $f.Name
-        $n = Convert-RawImportFile -RawPath $f.FullName -OutPath $out -MapPath $script:DeidentMapPath
-        $results += ("{0} -> {1} 筆已去識別化" -f $f.Name, $n)
-        Write-AuditLog -Action "DEIDENT_CONVERT" -Detail ("{0} rows={1}" -f $f.Name, $n)
+        if ($null -ne (Get-RunLogFileInfo -FileName $f.Name)) {
+            $results += ("{0} -> 機台 Log 檔, 免轉換 (Log 比對直接讀取)" -f $f.Name)
+            continue
+        }
+        if (Test-MeasurementMasterFile -Path $f.FullName) {
+            $results += ("{0} -> 量測總檔 (已為去識別後資料), 免轉換" -f $f.Name)
+            continue
+        }
+        try {
+            $out = Join-Path $script:ImportRoot $f.Name
+            $n = Convert-RawImportFile -RawPath $f.FullName -OutPath $out -MapPath $script:DeidentMapPath
+            $results += ("{0} -> {1} 筆已去識別化" -f $f.Name, $n)
+            Write-AuditLog -Action "DEIDENT_CONVERT" -Detail ("{0} rows={1}" -f $f.Name, $n)
+        } catch {
+            $results += ("{0} -> 轉換失敗: {1}" -f $f.Name, $_.Exception.Message)
+            Write-ErrorLog ("Convert-AllRawImports: {0} : {1}" -f $f.Name, $_.Exception.Message)
+        }
     }
     return $results
 }
@@ -886,6 +922,74 @@ function Get-RunLogCatalog {
     $list = @()
     foreach ($k in $order) { $list += $entries[$k] }
     return $list
+}
+
+# ============================================================
+# 資料表範本 (v1.0.9)
+# 於 Data\Import 建立六張資料表的空白範本 (僅標頭)。空表與無檔案的
+# 診斷行為完全相同 (行為中性), 目的是讓工程師知道要填哪些欄位。
+# 已存在的檔案一律不動。
+# ============================================================
+function Initialize-ImportTableTemplates {
+    $templates = @{
+        "RunSummary.csv"       = "RunID_Alias,ToolAlias,ChamberAlias,ProductFamily,RecipeFamily,RecipeVersionGroup,PreviousProductFamily,RunStartTime,RunEndTime,RunResult,OperatorShift,RecipeVersionChanged,RecipeChangeNote"
+        "ToolStability.csv"    = "RunID_Alias,ToolAlias,TempStabilityScore,PressureStabilityScore,MFCStabilityScore,RotationStabilityScore,VacuumRecoveryTimeMin,AlarmCountLastRun,CriticalAlarmCount,InterlockEventCount,CriticalAlarmWithin24h,RecentAlarmCodes"
+        "Maintenance.csv"      = "RunID_Alias,ToolAlias,DaysAfterPM,RunsAfterPM,DaysAfterPartChange,RecentSameAlarmCount7d,MTBFTrend,RecentCorrectiveMaintenance,GoldenRunVerified"
+        "ProductDrift.csv"     = "RunID_Alias,ToolAlias,ProductFamily,PLPeakShiftNm,ConsecutivePLShiftRuns,PLIntensityTrend,XRDPeakShiftDeg,ThicknessDeltaPct,UniformityTrend,RsDeltaPct,AOIDefectTrend,OverSpcWarning,OverSpcControl"
+        "MeasurementTrend.csv" = "RunID_Alias,ToolAlias,RunDate,AlarmCount,PLPeakShiftNm,ThicknessDeltaPct"
+        "HistoryCases.csv"     = "CaseID,ToolAlias,ProductFamily,RiskCategory,Keywords,Summary,Action,Outcome,CaseDate"
+    }
+    $created = @()
+    foreach ($name in $templates.Keys) {
+        $p = Join-Path $script:ImportRoot $name
+        if (-not (Test-Path -LiteralPath $p)) {
+            Write-AllTextUtf8 -Path $p -Text ([string]$templates[$name])
+            $created += $name
+        }
+    }
+    $doc = Join-Path $script:DataRoot "資料表欄位說明.txt"
+    if (-not (Test-Path -LiteralPath $doc)) {
+        $nl = [Environment]::NewLine
+        $help = @(
+            "資料表欄位說明 (Data\Import\*.csv; 以 RunID_Alias 為鍵, 一列一 Run)",
+            "所有 ID 應為去識別化代號 (可用設定頁 RawImport -> Import 轉換工具產生)。",
+            "機台秒級 Log 檔與量測總檔直接放入 Import / RawImport 即可, 不必建表。",
+            "",
+            "[RunSummary.csv] Run 基本資料 (機台/Run 下拉選單來源之一)",
+            "  RunID_Alias=Run 代號  ToolAlias=機台代號  ChamberAlias=腔體  ProductFamily=產品族",
+            "  RecipeFamily=Recipe 族  RecipeVersionGroup=Recipe 版本群  PreviousProductFamily=前一 Run 產品族",
+            "  RunStartTime/RunEndTime=起訖 (yyyy-MM-dd HH:mm:ss)  RunResult=Normal|Abnormal|Abort|Hold|Planned",
+            "  OperatorShift=班別  RecipeVersionChanged=0|1  RecipeChangeNote=變更說明 (含 ECN)",
+            "",
+            "[ToolStability.csv] 前一 Run 機台穩定度 (以該 Run 的 RunID_Alias 記錄)",
+            "  TempStabilityScore/PressureStabilityScore/MFCStabilityScore/RotationStabilityScore=0~100 分",
+            "  VacuumRecoveryTimeMin=真空恢復分鐘  AlarmCountLastRun=Alarm 總數  CriticalAlarmCount=Critical Alarm 數",
+            "  InterlockEventCount=Interlock 次數  CriticalAlarmWithin24h=0|1  RecentAlarmCodes=代碼(分號分隔)",
+            "",
+            "[Maintenance.csv] 維修 / PM 特徵",
+            "  DaysAfterPM=距上次 PM 天數  RunsAfterPM=PM 後第幾 Run  DaysAfterPartChange=距換件天數",
+            "  RecentSameAlarmCount7d=同一 Alarm 7 天內次數  MTBFTrend=Up|Flat|Down",
+            "  RecentCorrectiveMaintenance=Yes|No  GoldenRunVerified=Yes|No|NA",
+            "",
+            "[ProductDrift.csv] 產品特性飄移 (量測總檔存在時可不填, 系統自動彙總)",
+            "  PLPeakShiftNm=PL 峰值偏移 nm  ConsecutivePLShiftRuns=連續同方向偏移 Run 數",
+            "  PLIntensityTrend=Up|Flat|Down  XRDPeakShiftDeg=XRD 偏移度  ThicknessDeltaPct=厚度偏差%",
+            "  UniformityTrend=Better|Flat|Worse  RsDeltaPct=Rs 偏差%  AOIDefectTrend=Up|Flat|Down",
+            "  OverSpcWarning/OverSpcControl=0|1 (超出 SPC warning/control limit)",
+            "",
+            "[MeasurementTrend.csv] 趨勢圖資料 (診斷頁右側圖表)",
+            "  RunDate=yyyy-MM-dd  AlarmCount=Alarm 數  PLPeakShiftNm / ThicknessDeltaPct 同上",
+            "",
+            "[HistoryCases.csv] 歷史案例 (相似案例推薦來源)",
+            "  CaseID=案例代號  RiskCategory=Stability|Maintenance|Drift  Keywords=關鍵字(分號分隔)",
+            "  Summary=摘要  Action=處置  Outcome=結果  CaseDate=yyyy-MM-dd"
+        ) -join $nl
+        Write-AllTextUtf8 -Path $doc -Text $help
+    }
+    if ($created.Count -gt 0) {
+        Write-AppLog ("已建立資料表空白範本: " + ($created -join ", "))
+    }
+    return $created
 }
 
 # ============================================================
@@ -948,6 +1052,26 @@ function Import-MeasurementMasterRows {
     return $list.ToArray()
 }
 
+function Test-MeasurementMasterFile {
+    # 以標頭快速判斷檔案是否為量測總檔 (前 100 行內出現真實標頭)
+    param([string]$Path)
+    try {
+        $sr = New-Object System.IO.StreamReader($Path, [System.Text.Encoding]::UTF8, $true)
+        try {
+            for ($i = 0; $i -lt 100; $i++) {
+                $ln = $sr.ReadLine()
+                if ($null -eq $ln) { break }
+                if ($ln -match '^(?i)STRUCTURE\s*,\s*REACTOR' -and $ln -match 'RUN_NO' -and $ln -match '(^|,)\s*PF\s*(,|$)') {
+                    return $true
+                }
+            }
+        } finally { $sr.Dispose() }
+    } catch {
+        Write-ErrorLog ("Test-MeasurementMasterFile: {0} : {1}" -f $Path, $_.Exception.Message)
+    }
+    return $false
+}
+
 function Find-MeasurementMasterFiles {
     # 掃描 Import / RawImport 內的 *.csv / *.txt, 以標頭快速判斷是否為量測總檔
     $found = @()
@@ -955,22 +1079,7 @@ function Find-MeasurementMasterFiles {
         foreach ($pat in @("*.csv", "*.txt")) {
             $files = @(Get-ChildItem -LiteralPath $root -Filter $pat -ErrorAction SilentlyContinue)
             foreach ($f in $files) {
-                try {
-                    $isMeas = $false
-                    $sr = New-Object System.IO.StreamReader($f.FullName, [System.Text.Encoding]::UTF8, $true)
-                    try {
-                        for ($i = 0; $i -lt 100; $i++) {
-                            $ln = $sr.ReadLine()
-                            if ($null -eq $ln) { break }
-                            if ($ln -match '^(?i)STRUCTURE\s*,\s*REACTOR' -and $ln -match 'RUN_NO' -and $ln -match '(^|,)\s*PF\s*(,|$)') {
-                                $isMeas = $true; break
-                            }
-                        }
-                    } finally { $sr.Dispose() }
-                    if ($isMeas) { $found += $f.FullName }
-                } catch {
-                    Write-ErrorLog ("Find-MeasurementMasterFiles: {0} : {1}" -f $f.Name, $_.Exception.Message)
-                }
+                if (Test-MeasurementMasterFile -Path $f.FullName) { $found += $f.FullName }
             }
         }
     }
@@ -1643,7 +1752,8 @@ function Compare-StepCodeMeanTables {
         [hashtable]$BaseTable, [hashtable]$TestTable,
         [string]$BaseName, [string]$TestName,
         [double]$WarnPct, [double]$HighPct,
-        [int]$MinSec = 5, [int]$TopN = 10
+        [int]$MinSec = 5, [int]$TopN = 10,
+        [double]$MinBaseAbs = 0.0   # v1.0.9: 基準平均絕對值低於此者略過 (濾近零參數噪音)
     )
 
     $r = @{
@@ -1682,7 +1792,7 @@ function Compare-StepCodeMeanTables {
             $bv = $gb.Mean[$c]
             $tv = $gt.Mean[$c]
             if ($null -eq $bv -or $null -eq $tv) { continue }
-            if ([math]::Abs([double]$bv) -lt 1e-9) { continue }
+            if ([math]::Abs([double]$bv) -lt [math]::Max(1e-9, $MinBaseAbs)) { continue }
             $r.ComparedCells = $r.ComparedCells + 1
             $deltaPct = ([double]$tv - [double]$bv) / [math]::Abs([double]$bv) * 100.0
             $lv = 0
@@ -1753,22 +1863,23 @@ function Invoke-PreRunLogDiagnosis {
     $high   = Get-Threshold -Name "LogDeltaHighPct"    -DefaultValue 8.0
     $gWarn  = Get-Threshold -Name "GoldenDeltaWarnPct" -DefaultValue 5.0
     $gHigh  = Get-Threshold -Name "GoldenDeltaHighPct" -DefaultValue 10.0
-    $minSec = [int](Get-Threshold -Name "LogCompareMinSec" -DefaultValue 5)
-    $topN   = [int](Get-Threshold -Name "LogCompareTopN"   -DefaultValue 10)
+    $minSec  = [int](Get-Threshold -Name "LogCompareMinSec" -DefaultValue 5)
+    $topN    = [int](Get-Threshold -Name "LogCompareTopN"   -DefaultValue 10)
+    $minBase = Get-Threshold -Name "LogCompareMinBaseAbs" -DefaultValue 0.0
 
     $cmpPrevPrev = $null
     if (-not [string]::IsNullOrEmpty($PrevPrevLogPath)) {
         $tPP = Get-StepCodeMeanTable -LogPath $PrevPrevLogPath
         $cmpPrevPrev = Compare-StepCodeMeanTables -BaseTable $tPP -TestTable $tPrev `
             -BaseName ("N-2 " + $tPP.SourceName) -TestName ("N-1 " + $tPrev.SourceName) `
-            -WarnPct $warn -HighPct $high -MinSec $minSec -TopN $topN
+            -WarnPct $warn -HighPct $high -MinSec $minSec -TopN $topN -MinBaseAbs $minBase
     }
     $cmpGolden = $null
     if (-not [string]::IsNullOrEmpty($GoldenLogPath)) {
         $tG = Get-StepCodeMeanTable -LogPath $GoldenLogPath
         $cmpGolden = Compare-StepCodeMeanTables -BaseTable $tG -TestTable $tPrev `
             -BaseName ("Golden " + $tG.SourceName) -TestName ("N-1 " + $tPrev.SourceName) `
-            -WarnPct $gWarn -HighPct $gHigh -MinSec $minSec -TopN $topN
+            -WarnPct $gWarn -HighPct $gHigh -MinSec $minSec -TopN $topN -MinBaseAbs $minBase
     }
 
     $levels = @(0)
@@ -2386,9 +2497,10 @@ function Invoke-RunDiagnosis {
                 $lh = Get-Threshold -Name "LogDeltaHighPct" -DefaultValue 8.0
                 $lm = [int](Get-Threshold -Name "LogCompareMinSec" -DefaultValue 5)
                 $lt = [int](Get-Threshold -Name "LogCompareTopN"   -DefaultValue 10)
+                $lb = Get-Threshold -Name "LogCompareMinBaseAbs" -DefaultValue 0.0
                 $logCmp = Compare-StepCodeMeanTables -BaseTable $tPrev -TestTable $tSel `
                     -BaseName ("前一 Run " + [string]$prevLogEntry.RunId) -TestName ("Run " + $RunAlias) `
-                    -WarnPct $lw -HighPct $lh -MinSec $lm -TopN $lt
+                    -WarnPct $lw -HighPct $lh -MinSec $lm -TopN $lt -MinBaseAbs $lb
                 foreach ($x in $logCmp.Reasons) { $stab.Reasons += ("(Log 比對) " + $x) }
                 if ($logCmp.Level -gt $stab.Level) { $stab.Level = $logCmp.Level }
             } catch {
@@ -3078,6 +3190,42 @@ function Invoke-SelfTest {
     & $assert ($dMeas.Drift.Level -ge 3 -and $driftText.Contains("量測最終判定")) "量測總檔: PF Fail -> 高風險"
     & $assert ($driftText.Contains("Rs 相對偏差") -and $driftText.Contains("(量測總檔)")) "量測總檔: Rs 偏差併入既有規則與摘要"
 
+    # --- 19. 現場回饋修正 (v1.0.9) ---
+    # 資料表範本: 既有檔案不覆蓋, 缺少者補建, 欄位說明檔產出
+    $rsBefore = Read-AllTextUtf8 -Path (Join-Path $script:ImportRoot "RunSummary.csv")
+    Initialize-ImportTableTemplates | Out-Null
+    $rsAfter = Read-AllTextUtf8 -Path (Join-Path $script:ImportRoot "RunSummary.csv")
+    & $assert ((Test-Path -LiteralPath (Join-Path $script:ImportRoot "MeasurementTrend.csv")) -and `
+               (Test-Path -LiteralPath (Join-Path $script:DataRoot "資料表欄位說明.txt"))) "範本: 缺少的資料表與欄位說明已建立"
+    & $assert ($rsAfter -eq $rsBefore) "範本: 既有資料表不覆蓋"
+
+    # 單列 CSV 去識別化 (PS 5.1 StrictMode .Count 回歸)
+    $rawOne = Join-Path $script:RawImportRoot "OneRow.csv"
+    Write-AllTextUtf8 -Path $rawOne -Text ("RunID,ToolID" + [Environment]::NewLine + "R26-000001,MOCVD-Z9")
+    $nOne = Convert-RawImportFile -RawPath $rawOne -OutPath (Join-Path $script:ImportRoot "OneRow.csv") -MapPath $script:DeidentMapPath
+    & $assert ($nOne -eq 1) "去識別化: 單列檔案正常 (Count 回歸)"
+
+    # 機台 Log 檔與量測總檔於批次轉換時自動略過
+    Copy-Item -LiteralPath (Join-Path $script:ImportRoot "H01B9N.PRODUCT.B9N.P02069_M06_P(NGR)_MAT06261174_17154.csv") `
+        -Destination (Join-Path $script:RawImportRoot "H01B9N.PRODUCT.B9N.P02069_M06_P(NGR)_MAT06261174_17154.csv") -Force
+    Copy-Item -LiteralPath $measPath -Destination (Join-Path $script:RawImportRoot "Measurement_raw.csv") -Force
+    $convRes = @(Convert-AllRawImports)
+    $skipLog = $false; $skipMeas = $false
+    foreach ($x in $convRes) {
+        if ($x.Contains("機台 Log 檔, 免轉換")) { $skipLog = $true }
+        if ($x.Contains("量測總檔")) { $skipMeas = $true }
+    }
+    & $assert ($skipLog -and $skipMeas) "去識別化: 機台 Log 與量測總檔自動略過"
+
+    # Log 比對近零基準門檻 (LogCompareMinBaseAbs)
+    $tinyBase = @{ Order = @("1"); Groups = @{ "1" = @{ Key = "1"; Stepcode = "11"; N = 10; Mean = @{ P = 0.02 } } }
+                   NumCols = @("P"); RowCount = 10; SourceName = "b" }
+    $tinyTest = @{ Order = @("1"); Groups = @{ "1" = @{ Key = "1"; Stepcode = "11"; N = 10; Mean = @{ P = -1.5 } } }
+                   NumCols = @("P"); RowCount = 10; SourceName = "t" }
+    $cmpTiny = Compare-StepCodeMeanTables -BaseTable $tinyBase -TestTable $tinyTest -BaseName "b" -TestName "t" `
+        -WarnPct 3.0 -HighPct 8.0 -MinSec 5 -TopN 5 -MinBaseAbs 0.05
+    & $assert ($cmpTiny.ComparedCells -eq 0 -and $cmpTiny.Level -eq 0) "LogCmp: 近零基準參數依門檻略過"
+
     # --- 收尾 ---
     Write-Host ""
     Write-Host ("SelfTest 結果: PASS={0} FAIL={1}" -f $t.Pass, $t.Fail)
@@ -3693,7 +3841,7 @@ function Build-HistoryTab {
         try {
             $grid.Rows.Clear()
             # Pitfall 1: 閉包內不可讀 $script: 變數, 改用函式取路徑
-            $rows = Import-CsvSafe -Path (Get-HumanReviewCsvPath)
+            $rows = @(Import-CsvSafe -Path (Get-HumanReviewCsvPath))
             $sorted = @($rows | Sort-Object -Property @{ Expression = { Get-FieldString -Object $_ -PropertyName "ReviewTime" }; Descending = $true })
             foreach ($r in $sorted) {
                 [void]$grid.Rows.Add(
@@ -4199,6 +4347,7 @@ try {
     Initialize-Config
     Initialize-UsersCsv
     Initialize-HumanReviewCsv
+    Initialize-ImportTableTemplates | Out-Null   # v1.0.9: 資料表空白範本 (既有檔案不動)
     Write-AppLog ($script:AppName + " v" + $script:AIVersion + " started.")
     Show-MainForm
     Write-AppLog ($script:AppName + " closed.")
@@ -4207,7 +4356,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.8
+# EOF RunPreCheckAI.ps1 v1.0.9
 
 
 
