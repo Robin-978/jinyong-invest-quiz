@@ -25,6 +25,20 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.8  新增: 量測總檔 (Measurement Master) 支援 — Import/RawImport 內含
+          STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,... 標頭之 CSV/TXT 自動偵測
+          (可含表頭說明前言, 自動跳過並定位真實標頭):
+          (1) Import-MeasurementMasterRows / Get-MeasurementRunCatalog —
+              每片 wafer 資料依 機台(REACTOR 尾碼數字)+RUN_NO 彙總:
+              Pass/Fail 統計、FAIL_NO 代碼、Rs/均勻性/Haze/LPD3+4/PL 平均;
+          (2) Log 檔名目錄模式診斷時, ProductDrift 查無資料改以量測總檔為
+              產品特性飄移來源 (取 RunId <= 本 Run 的最近量測 Run, 符合
+              N-2 資料時效): Rs 偏差% 餵入既有 RsWarnPct 規則、均勻性 STD
+              增幅 -> Worse、LPD3+4/Area_total 增幅 -> AOI Up、PL 波長偏移
+              與連續同方向 Run 數餵入既有 PL 規則; PF 出現 Fail -> 高風險;
+          (3) 新增門檻 MeasUnifWorsenPct/MeasDefectUpPct/PLShiftMinNm;
+          SelfTest 增至 104 項 (前言跳過、Run 彙總、來源選取、Fail 高風險、
+          Rs 偏差規則)。
    1.0.7  新增: 機台 Log 檔名目錄 — Import/RawImport 內的秒級 Log 檔
           (檔名慣例 <產品>.xxx..._MAT<機台2碼><Run碼>_<流水號>.csv, 如
           H01B9N.PRODUCT.B9N.P02069_M06_P(NGR)_MAT06261175_17155.csv):
@@ -108,7 +122,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.7"
+$script:AIVersion = "1.0.8"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -469,6 +483,9 @@ function Get-DefaultConfig {
             GoldenDeltaHighPct     = 10.0   # N-1 vs Golden |差異%| > 此 -> High
             LogCompareMinSec       = 5      # Step 秒數低於此不列入比對 (避免短 step 噪音)
             LogCompareTopN         = 10     # 報告列出差異最大的前 N 筆
+            MeasUnifWorsenPct      = 20.0   # 量測總檔: 均勻性 STD 增幅% > 此 -> 趨勢 Worse
+            MeasDefectUpPct        = 30.0   # 量測總檔: 缺陷 (LPD3+4/Area_total) 平均增幅% > 此 -> 趨勢 Up
+            PLShiftMinNm           = 0.5    # 量測總檔: PL 波長偏移絕對值 >= 此 (nm) 才計入連續偏移
         }
     }
 }
@@ -869,6 +886,249 @@ function Get-RunLogCatalog {
     $list = @()
     foreach ($k in $order) { $list += $entries[$k] }
     return $list
+}
+
+# ============================================================
+# 量測總檔 (Measurement Master, v1.0.8)
+# 標頭: STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,FAIL_NO,...,LEHI_RS,...
+#   STRUCTURE=產品名 / REACTOR=EQPID (如 Tool06) / RUN_NO=RUNID /
+#   POS_NO=擺放位置 / PF=最終判定 Pass|Fail / FAIL_NO=Fail 代碼
+#   量測欄: ODD1,ODD2,Area_Cnt,Area_total,Haze avg (表面缺陷),
+#           LEHI_RS,LEHI_UNIF_STD (Rs 與均勻性), LPD3+4 (表面缺陷),
+#           AGA_WL_AVG,IGA_WL_* (PL, 非所有產品皆量測)
+# 檔案可含表頭說明前言 (# 註解與欄位片段行), 解析時自動定位真實標頭。
+# 機台對應: REACTOR 尾碼數字 == Log 檔名 MAT 尾碼數字 (Tool06 <-> MAT06)。
+# ============================================================
+$script:MeasurementMetricCols = @(
+    "LEHI_RS", "LEHI_UNIF_STD", "Haze avg", "LPD3+4",
+    "Area_Cnt", "Area_total", "ODD1", "ODD2", "R2R_W2W",
+    "AGA_WL_AVG", "IGA_WL_AVG", "IGA_WL_MAX", "IGA_WL_STD", "IGA_INT", "IGA_FWHM")
+
+function Get-ToolNumber {
+    # 取機台識別尾碼數字 (MAT06 / Tool06 -> 6); 無數字回傳 -1
+    param([string]$Name)
+    if (-not [string]::IsNullOrEmpty($Name) -and $Name -match '(\d+)\s*$') { return [int]$matches[1] }
+    return -1
+}
+
+function Import-MeasurementMasterRows {
+    <#
+      解析量測總檔為 hashtable 列陣列 (key = 標頭欄名, 值已 Trim)。
+      真實標頭 = 以 STRUCTURE,REACTOR 開頭且欄位含 RUN_NO 與 PF 的行
+      (前言中的欄位片段行如 "STRUCTURE,REACTOR,RUN_NO,POS_NO," 無 PF, 不會誤判);
+      標頭之後的空白行與 # 註解行略過; 短列缺欄視為空值。
+    #>
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $lines = [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)
+    $hdrIdx = -1
+    $header = $null
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $ln = $lines[$i].Trim()
+        if ($ln -notmatch '^(?i)STRUCTURE\s*,\s*REACTOR') { continue }
+        $names = @()
+        foreach ($x in (Split-CsvLineFields -Line $ln)) { $names += $x.Trim() }
+        if ($names -contains "RUN_NO" -and $names -contains "PF") { $hdrIdx = $i; $header = $names; break }
+    }
+    if ($hdrIdx -lt 0) { return @() }
+
+    $list = New-Object System.Collections.Generic.List[object]
+    for ($i = $hdrIdx + 1; $i -lt $lines.Length; $i++) {
+        $ln = $lines[$i]
+        if ([string]::IsNullOrEmpty($ln) -or $ln.Trim().Length -eq 0) { continue }
+        if ($ln.TrimStart().StartsWith("#")) { continue }
+        $f = Split-CsvLineFields -Line $ln
+        $h = @{}
+        $n = [math]::Min($header.Count, $f.Length)
+        for ($j = 0; $j -lt $n; $j++) { $h[$header[$j]] = $f[$j].Trim() }
+        [void]$list.Add($h)
+    }
+    # 注意: 這裡不可用 @($list) — List[object] 經 @() 轉換會觸發
+    # PSToObjectArrayBinder 的 "Argument types do not match" 錯誤
+    return $list.ToArray()
+}
+
+function Find-MeasurementMasterFiles {
+    # 掃描 Import / RawImport 內的 *.csv / *.txt, 以標頭快速判斷是否為量測總檔
+    $found = @()
+    foreach ($root in @((Get-ImportRootPath), (Get-RawImportRootPath))) {
+        foreach ($pat in @("*.csv", "*.txt")) {
+            $files = @(Get-ChildItem -LiteralPath $root -Filter $pat -ErrorAction SilentlyContinue)
+            foreach ($f in $files) {
+                try {
+                    $isMeas = $false
+                    $sr = New-Object System.IO.StreamReader($f.FullName, [System.Text.Encoding]::UTF8, $true)
+                    try {
+                        for ($i = 0; $i -lt 100; $i++) {
+                            $ln = $sr.ReadLine()
+                            if ($null -eq $ln) { break }
+                            if ($ln -match '^(?i)STRUCTURE\s*,\s*REACTOR' -and $ln -match 'RUN_NO' -and $ln -match '(^|,)\s*PF\s*(,|$)') {
+                                $isMeas = $true; break
+                            }
+                        }
+                    } finally { $sr.Dispose() }
+                    if ($isMeas) { $found += $f.FullName }
+                } catch {
+                    Write-ErrorLog ("Find-MeasurementMasterFiles: {0} : {1}" -f $f.Name, $_.Exception.Message)
+                }
+            }
+        }
+    }
+    return $found
+}
+
+function Get-MeasurementRunCatalog {
+    <#
+      量測總檔 -> 每 Run 彙總 (每列 = 一片 wafer, 依 機台尾碼+RUN_NO 分組):
+      @{ ToolNum; ToolName; RunId; Structure; GDate; WaferCount;
+         PassCount; FailCount; FailCodes; Mean(各量測欄, 無值為 $null); SourceFile }
+    #>
+    $groups = @{}
+    $order = New-Object System.Collections.Generic.List[string]
+    foreach ($path in @(Find-MeasurementMasterFiles)) {
+        foreach ($r in @(Import-MeasurementMasterRows -Path $path)) {
+            $reactor = Get-FieldString -Object $r -PropertyName "REACTOR"
+            $runNo   = Get-FieldString -Object $r -PropertyName "RUN_NO"
+            if ([string]::IsNullOrEmpty($reactor) -or $runNo -notmatch '^\d+$') { continue }
+            $tn = Get-ToolNumber -Name $reactor
+            if ($tn -lt 0) { continue }
+            $key = [string]$tn + "|" + $runNo
+            if (-not $groups.ContainsKey($key)) {
+                $g = @{
+                    ToolNum = $tn; ToolName = $reactor; RunId = $runNo
+                    Structure = (Get-FieldString -Object $r -PropertyName "STRUCTURE")
+                    GDate     = (Get-FieldString -Object $r -PropertyName "G_DATE")
+                    WaferCount = 0; PassCount = 0; FailCount = 0; FailCodes = @()
+                    Sum = @{}; Cnt = @{}; Mean = @{}
+                    SourceFile = (Split-Path -Leaf $path)
+                }
+                foreach ($c in $script:MeasurementMetricCols) { $g.Sum[$c] = 0.0; $g.Cnt[$c] = 0 }
+                $groups[$key] = $g
+                [void]$order.Add($key)
+            }
+            $g = $groups[$key]
+            $g.WaferCount = $g.WaferCount + 1
+            $pf = (Get-FieldString -Object $r -PropertyName "PF").ToUpper()
+            if ($pf -eq "PASS") { $g.PassCount = $g.PassCount + 1 }
+            elseif ($pf -eq "FAIL") {
+                $g.FailCount = $g.FailCount + 1
+                $fc = Get-FieldString -Object $r -PropertyName "FAIL_NO"
+                if (-not [string]::IsNullOrEmpty($fc) -and (@($g.FailCodes) -notcontains $fc)) { $g.FailCodes += $fc }
+            }
+            foreach ($c in $script:MeasurementMetricCols) {
+                $v = ConvertTo-DoubleInvariant -Text (Get-FieldString -Object $r -PropertyName $c)
+                if ($null -ne $v) {
+                    $g.Sum[$c] = $g.Sum[$c] + $v
+                    $g.Cnt[$c] = $g.Cnt[$c] + 1
+                }
+            }
+        }
+    }
+    $list = @()
+    foreach ($k in $order) {
+        $g = $groups[$k]
+        foreach ($c in $script:MeasurementMetricCols) {
+            if ($g.Cnt[$c] -gt 0) { $g.Mean[$c] = [double]($g.Sum[$c] / $g.Cnt[$c]) }
+            else { $g.Mean[$c] = $null }
+        }
+        $list += $g
+    }
+    return $list
+}
+
+function Get-MeasurementDriftInfo {
+    <#
+      依機台 (MAT06 / Tool06 皆取尾碼數字對應) 找 RunId <= UpToRunId 的
+      最近量測 Run (符合 N-2 資料時效), 與再前一量測 Run 比較, 產出:
+      - DriftRow: 餵給 Get-DriftRisk 的欄位 (RsDeltaPct / PLPeakShiftNm /
+        ConsecutivePLShiftRuns / UniformityTrend / AOIDefectTrend)
+      - ValueSummary: 主要量測值摘要字串 (本 Run vs 前 Run)
+      回傳 $null (無資料) 或 @{ Current; Previous; DriftRow; ValueSummary }
+      僅做整理 / 比對, 不判定放行 (PF 為量測系統之最終判定, 僅轉述)。
+    #>
+    param([string]$ToolAlias, [long]$UpToRunId)
+    $tn = Get-ToolNumber -Name $ToolAlias
+    if ($tn -lt 0) { return $null }
+    $mine = @()
+    foreach ($m in @(Get-MeasurementRunCatalog)) {
+        if ([int]$m.ToolNum -ne $tn) { continue }
+        if ([long]$m.RunId -gt $UpToRunId) { continue }
+        $mine += $m
+    }
+    if ($mine.Count -eq 0) { return $null }
+    $mine = @($mine | Sort-Object -Property @{ Expression = { [long]$_.RunId }; Descending = $true })
+    $cur = $mine[0]
+    $prev = $null
+    if ($mine.Count -ge 2) { $prev = $mine[1] }
+
+    $unifWorsen = Get-Threshold -Name "MeasUnifWorsenPct" -DefaultValue 20.0
+    $defUp      = Get-Threshold -Name "MeasDefectUpPct"   -DefaultValue 30.0
+    $plMin      = Get-Threshold -Name "PLShiftMinNm"      -DefaultValue 0.5
+
+    $row = @{ RunID_Alias = [string]$cur.RunId }
+    if ($null -ne $prev) {
+        $rc = $cur.Mean["LEHI_RS"]; $rp = $prev.Mean["LEHI_RS"]
+        if ($null -ne $rc -and $null -ne $rp -and [math]::Abs([double]$rp) -gt 1e-9) {
+            $row["RsDeltaPct"] = [math]::Round((([double]$rc - [double]$rp) / [math]::Abs([double]$rp)) * 100.0, 2)
+        }
+        $uc = $cur.Mean["LEHI_UNIF_STD"]; $up = $prev.Mean["LEHI_UNIF_STD"]
+        if ($null -ne $uc -and $null -ne $up -and [double]$up -gt 1e-9) {
+            if (((([double]$uc - [double]$up) / [double]$up) * 100.0) -gt $unifWorsen) { $row["UniformityTrend"] = "Worse" }
+        }
+        $defCol = ""
+        foreach ($c in @("LPD3+4", "Area_total")) {
+            if ($null -ne $cur.Mean[$c] -and $null -ne $prev.Mean[$c]) { $defCol = $c; break }
+        }
+        if (-not [string]::IsNullOrEmpty($defCol)) {
+            $dc = [double]$cur.Mean[$defCol]; $dp = [double]$prev.Mean[$defCol]
+            if ($dp -gt 1e-9 -and ((($dc - $dp) / $dp) * 100.0) -gt $defUp) { $row["AOIDefectTrend"] = "Up" }
+        }
+        # PL 波長偏移與連續同方向偏移 Run 數 (非所有產品皆量測 PL)
+        $plCol = ""
+        foreach ($c in @("IGA_WL_AVG", "AGA_WL_AVG")) {
+            if ($null -ne $cur.Mean[$c] -and $null -ne $prev.Mean[$c]) { $plCol = $c; break }
+        }
+        if (-not [string]::IsNullOrEmpty($plCol)) {
+            $shift = [double]$cur.Mean[$plCol] - [double]$prev.Mean[$plCol]
+            $row["PLPeakShiftNm"] = [math]::Round($shift, 3)
+            $consec = 0
+            if ([math]::Abs($shift) -ge $plMin) {
+                $sign = [math]::Sign($shift)
+                $consec = 1
+                for ($i = 1; $i -lt ($mine.Count - 1); $i++) {
+                    $a = $mine[$i].Mean[$plCol]; $b = $mine[$i + 1].Mean[$plCol]
+                    if ($null -eq $a -or $null -eq $b) { break }
+                    $d = [double]$a - [double]$b
+                    if ([math]::Abs($d) -lt $plMin -or [math]::Sign($d) -ne $sign) { break }
+                    $consec++
+                }
+            }
+            $row["ConsecutivePLShiftRuns"] = $consec
+        }
+    }
+
+    # 主要量測值摘要 (本 Run vs 前一量測 Run)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $vals = @()
+    foreach ($def in @(
+        @("LEHI_RS", "Rs", "0.###"),
+        @("LEHI_UNIF_STD", "均勻性STD", "0.###"),
+        @("Haze avg", "Haze", "0.####"),
+        @("LPD3+4", "LPD3+4", "0.#"),
+        @("IGA_WL_AVG", "PL波長", "0.##"))) {
+        $c = [string]$def[0]
+        $cv = "-"
+        if ($null -ne $cur.Mean[$c]) { $cv = ([double]$cur.Mean[$c]).ToString([string]$def[2], $inv) }
+        $pv = "-"
+        if ($null -ne $prev -and $null -ne $prev.Mean[$c]) { $pv = ([double]$prev.Mean[$c]).ToString([string]$def[2], $inv) }
+        if ($cv -ne "-" -or $pv -ne "-") { $vals += ("{0} {1} (前 {2})" -f [string]$def[1], $cv, $pv) }
+    }
+
+    return @{
+        Current = $cur; Previous = $prev
+        DriftRow = $row
+        ValueSummary = ($vals -join "; ")
+    }
 }
 
 # ============================================================
@@ -2071,6 +2331,18 @@ function Invoke-RunDiagnosis {
         if ($null -ne $driftRow) { $driftSourceAlias = $RunAlias }
     }
 
+    # v1.0.8: Log 檔名目錄模式 — ProductDrift 查無資料時, 改以量測總檔
+    # (STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,...) 為產品特性飄移來源;
+    # 取 RunId <= 本 Run 的最近量測 Run (符合量測資料時效, 通常為 N-2)
+    $measInfo = $null
+    if ($null -ne $logEntry -and $null -eq $driftRow) {
+        $measInfo = Get-MeasurementDriftInfo -ToolAlias $toolAlias -UpToRunId ([long]$RunAlias)
+        if ($null -ne $measInfo) {
+            $driftRow = $measInfo.DriftRow
+            $driftSourceAlias = [string]$measInfo.Current.RunId
+        }
+    }
+
     $missing = @{ Items = @() }
     $stab  = Get-StabilityRisk   -StabilityRow $stabRow  -PrevRunRow $prevRunRow -Missing $missing
     $maint = Get-MaintenanceRisk -MaintRow $maintRow -StabilityRow $stabRow -Missing $missing
@@ -2082,6 +2354,25 @@ function Invoke-RunDiagnosis {
     }
     if (-not [string]::IsNullOrEmpty($prevPrevRunAlias) -and $null -eq (Find-RowByRun -Rows $driftRows -RunAlias $prevPrevRunAlias)) {
         $missing.Items += ("缺少上上 Run (N-2) 量測資料 (ProductDrift: " + $prevPrevRunAlias + ")")
+    }
+
+    # v1.0.8: 量測總檔摘要與 PF 最終判定 (僅轉述量測系統結果, 不放行/不判 Fail 原因)
+    if ($null -ne $measInfo) {
+        $mCur = $measInfo.Current
+        $prevTxt = "無更早量測 Run 可比較"
+        if ($null -ne $measInfo.Previous) { $prevTxt = ("對比前一量測 Run " + [string]$measInfo.Previous.RunId) }
+        $drift.Reasons += ("(量測總檔) 來源 Run {0} ({1}, {2} 片: Pass {3} / Fail {4}; {5}; 檔案: {6})" -f `
+            [string]$mCur.RunId, [string]$mCur.Structure, $mCur.WaferCount, $mCur.PassCount, $mCur.FailCount, $prevTxt, [string]$mCur.SourceFile)
+        if (-not [string]::IsNullOrEmpty([string]$measInfo.ValueSummary)) {
+            $drift.Reasons += ("(量測總檔) " + $measInfo.ValueSummary)
+        }
+        if ($mCur.FailCount -gt 0) {
+            $codes = (@($mCur.FailCodes) -join ";")
+            if ([string]::IsNullOrEmpty($codes)) { $codes = "未填 FAIL_NO" }
+            Add-RiskReason -Result $drift -Level 3 -Reason ("量測最終判定 (PF) 出現 Fail {0} 片 (FAIL_NO: {1}), 請確認 Fail 原因是否與本機台相關。" -f $mCur.FailCount, $codes)
+        }
+    } elseif ($null -ne $logEntry) {
+        $missing.Items += "Import/RawImport 未找到此機台的量測總檔 (STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,... 格式)"
     }
 
     # v1.0.7: Log 檔名目錄模式 — 自動以本 Run Log vs 前一 Run Log 做
@@ -2750,6 +3041,42 @@ function Invoke-SelfTest {
     $hasLogCmpReason = $false
     foreach ($x in $dLog.Stability.Reasons) { if ($x.StartsWith("(Log 比對)")) { $hasLogCmpReason = $true; break } }
     & $assert ($hasLogCmpReason -and $dLog.Stability.Level -ge 3) "LogCatalog: Log 比對併入穩定度 (Temp +10% -> 高)"
+
+    # --- 18. 量測總檔 (v1.0.8): 前言跳過 / Run 彙總 / 診斷整合 ---
+    $measPath = Join-Path $script:ImportRoot "Measurement_test.txt"
+    $measLines = @(
+        "#量測總檔表頭說明",
+        "",
+        "STRUCTURE,REACTOR,RUN_NO,POS_NO,",
+        "-STRUCTURE=產品名,",
+        "-REACTOR=EQPID,",
+        "",
+        "#以下為去識別後的Data",
+        "",
+        "STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,FAIL_NO,COMMENT,R2R_W2W,ODD1,ODD2,Area_Cnt,Area_total,Haze avg,LEHI_RS,LEHI_UNIF_STD,AGA_WL_AVG,IGA_WL_AVG,LPD3+4",
+        "PRO-001,Tool06,261172,A,Pass,,,,0.195,17,2,0.0542,0.052,6.50,0.40,,,30",
+        "PRO-001,Tool06,261172,B,Pass,,,,0.227,31,2,0.0716,0.050,6.51,0.41,,,32",
+        "PRO-001,Tool06,261172,C,Pass,,,,0.208,17,2,0.0538,0.051,6.49,0.39,,,28",
+        "PRO-001,Tool06,261173,A,Pass,,,,0.403,20,10,0.272,0.055,6.70,0.42,,,45",
+        "PRO-001,Tool06,261173,B,Fail,F123,,,0.377,15,5,0.193,0.056,6.71,0.41,,,44",
+        "PRO-001,Tool06,261173,C,Pass,,,,0.305,17,6,0.134,0.054,6.69,0.42,,,46"
+    )
+    Write-AllTextUtf8 -Path $measPath -Text ($measLines -join [Environment]::NewLine)
+
+    $measRows = @(Import-MeasurementMasterRows -Path $measPath)
+    & $assert ($measRows.Count -eq 6 -and (Get-FieldString -Object $measRows[0] -PropertyName "LEHI_RS") -eq "6.50") "量測總檔: 前言跳過並解析資料列"
+    $measCat = @(Get-MeasurementRunCatalog)
+    $m06 = @()
+    foreach ($m in $measCat) { if ([int]$m.ToolNum -eq 6) { $m06 += $m } }
+    $m173 = $null
+    foreach ($m in $m06) { if ($m.RunId -eq "261173") { $m173 = $m } }
+    & $assert ($m06.Count -eq 2 -and $null -ne $m173 -and $m173.WaferCount -eq 3 -and $m173.FailCount -eq 1) "量測總檔: 依機台+Run 彙總 (含 Fail 統計)"
+
+    $dMeas = Invoke-RunDiagnosis -RunAlias "261175"
+    & $assert ($dMeas.DriftSourceRun -eq "261173") "量測總檔: 量測來源取最近可用 Run (資料時效)"
+    $driftText = ($dMeas.Drift.Reasons -join " | ")
+    & $assert ($dMeas.Drift.Level -ge 3 -and $driftText.Contains("量測最終判定")) "量測總檔: PF Fail -> 高風險"
+    & $assert ($driftText.Contains("Rs 相對偏差") -and $driftText.Contains("(量測總檔)")) "量測總檔: Rs 偏差併入既有規則與摘要"
 
     # --- 收尾 ---
     Write-Host ""
@@ -3880,7 +4207,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.7
+# EOF RunPreCheckAI.ps1 v1.0.8
 
 
 
