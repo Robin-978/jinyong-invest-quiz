@@ -25,6 +25,15 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.12 新增 (依現場回饋): 趨勢圖無 PL 資料時改畫 Rs —
+          部分產品不量 PL (AGA/IGA 空白), 原趨勢圖 PL 線恆為空。
+          (1) 新增 Get-TrendChartData (資料與 UI 分離, 可自我測試):
+              以 MeasurementTrend 為主, 由量測總檔合併每 Run 的 Rs 平均
+              (LEHI_RS); 該機台完全無 PL 資料時, 主線自動改畫 Rs,
+              Y 軸標題與圖例同步切換; 表無資料時直接以量測總檔 Run 作圖;
+          (2) 排序改 RunDate + Run 碼數字 (同日期不再亂序);
+              缺值畫空點 (不再以 0 畫成假平線), 全空數列不顯示;
+          SelfTest 增至 119 項。
    1.0.11 修正 (依現場回饋): 資料表 RunID_Alias 鍵格式容錯 —
           工程師於 ToolStability / Maintenance / ProductDrift 填入
           「機台+Run 碼」(如 MAT06261176) 時, 系統以「Run 碼」(261176)
@@ -160,7 +169,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.11"
+$script:AIVersion = "1.0.12"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -3398,6 +3407,14 @@ function Invoke-SelfTest {
     & $assert ((-not $flexStab.Contains("無前一 Run 穩定度資料")) -and $flexStab.Contains("轉速穩定分數")) "鍵容錯: 穩定度資料以機台+Run 碼查得"
     & $assert (-not $flexMaint.Contains("無 PM / 維修資料")) "鍵容錯: 維修資料以機台+Run 碼查得"
 
+    # --- 22. 趨勢圖資料: 無 PL 資料時改用 Rs (v1.0.12) ---
+    $trend = Get-TrendChartData -ToolAlias "MAT06"
+    & $assert ((-not $trend.UsePl) -and $trend.UseRs) "趨勢圖: 無 PL 資料時改用 Rs"
+    $tItems = @($trend.Items)
+    $lastIt = $tItems[$tItems.Count - 1]
+    & $assert ($tItems.Count -ge 2 -and [string]$lastIt.RunId -eq "261173" -and `
+               $null -ne $lastIt.Rs -and [math]::Abs([double]$lastIt.Rs - 6.7) -lt 0.01) "趨勢圖: Rs 數列由量測總檔合併 (舊->新排序)"
+
     # --- 收尾 ---
     Write-Host ""
     Write-Host ("SelfTest 結果: PASS={0} FAIL={1}" -f $t.Pass, $t.Fail)
@@ -3517,31 +3534,97 @@ function New-TrendChart {
     return $chart
 }
 
+function Get-TrendChartData {
+    <#
+      趨勢圖資料準備 (v1.0.12; 與 UI 分離, 供 SelfTest 驗證):
+      - 以 MeasurementTrend 表為主 (Alarm / PL 偏移 / 厚度偏差)
+      - 由量測總檔目錄合併每 Run 的 Rs 平均 (LEHI_RS)
+      - 該機台完全無 PL 資料時 UseRs=true — 主線改畫 Rs
+        (現場需求: 部分產品不量 PL, 原 PL 線恆為空)
+      - 表無資料時直接以量測總檔的 Run 清單作圖
+      回傳 @{ Items (舊->新; RunId/RunDate/Alarm/Pl/Thk/Rs, 缺值為 $null);
+              UsePl; UseRs }
+    #>
+    param([string]$ToolAlias)
+    $maxN = [int](Get-Threshold -Name "TrendRunCount" -DefaultValue 10)
+
+    # 量測總檔: Rs 平均與 Run 清單 (機台以 MAT 尾碼對應)
+    $rsByRun = @{}
+    $catRuns = @()
+    try {
+        foreach ($m in @(Get-MeasurementRunCatalog)) {
+            if (("MAT{0:D2}" -f [int]$m.ToolNum) -ne $ToolAlias) { continue }
+            $catRuns += $m
+            if ($null -ne $m.Mean["LEHI_RS"]) { $rsByRun[[string]$m.RunId] = [double]$m.Mean["LEHI_RS"] }
+        }
+    } catch { }
+
+    $rows = @()
+    try { $rows = @(Get-DataRows -TableName "MeasurementTrend") } catch { $rows = @() }
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $rows) {
+        if ((Get-FieldString -Object $r -PropertyName "ToolAlias") -ne $ToolAlias) { continue }
+        $rid = Get-FieldString -Object $r -PropertyName "RunID_Alias"
+        if ([string]::IsNullOrEmpty($rid)) { continue }
+        $alarm = $null; $pl = $null; $thk = $null
+        if (-not (Test-FieldMissing -Object $r -PropertyName "AlarmCount"))        { $alarm = Get-FieldInt    -Object $r -PropertyName "AlarmCount" }
+        if (-not (Test-FieldMissing -Object $r -PropertyName "PLPeakShiftNm"))     { $pl    = Get-FieldDouble -Object $r -PropertyName "PLPeakShiftNm" }
+        if (-not (Test-FieldMissing -Object $r -PropertyName "ThicknessDeltaPct")) { $thk   = Get-FieldDouble -Object $r -PropertyName "ThicknessDeltaPct" }
+        $rs = $null
+        if ($rsByRun.ContainsKey($rid)) { $rs = [double]$rsByRun[$rid] }
+        [void]$items.Add(@{ RunId = $rid; RunDate = (Get-FieldString -Object $r -PropertyName "RunDate")
+                            Alarm = $alarm; Pl = $pl; Thk = $thk; Rs = $rs })
+    }
+    if ($items.Count -eq 0 -and $catRuns.Count -gt 0) {
+        foreach ($m in $catRuns) {
+            $rs = $null
+            if ($rsByRun.ContainsKey([string]$m.RunId)) { $rs = [double]$rsByRun[[string]$m.RunId] }
+            [void]$items.Add(@{ RunId = [string]$m.RunId; RunDate = [string]$m.GDate
+                                Alarm = $null; Pl = $null; Thk = $null; Rs = $rs })
+        }
+    }
+
+    # 舊 -> 新: RunDate 為主, Run 碼數字為輔 (同日期 / 空日期時不亂序)
+    $sorted = @($items | Sort-Object -Property `
+        @{ Expression = { [string]$_.RunDate } }, `
+        @{ Expression = { $v = 0L; [void][long]::TryParse([string]$_.RunId, [ref]$v); $v } })
+    if ($sorted.Count -gt $maxN) { $sorted = @($sorted[($sorted.Count - $maxN)..($sorted.Count - 1)]) }
+
+    $usePl = $false
+    $anyRs = $false
+    foreach ($it in $sorted) {
+        if ($null -ne $it.Pl) { $usePl = $true }
+        if ($null -ne $it.Rs) { $anyRs = $true }
+    }
+    return @{ Items = $sorted; UsePl = $usePl; UseRs = ((-not $usePl) -and $anyRs) }
+}
+
 function Update-TrendChart {
     param([object]$Chart, [string]$ToolAlias)
     if ($null -eq $Chart) { return }
     $Chart.Series.Clear()
-    $rows = @()
-    try { $rows = @(Get-DataRows -TableName "MeasurementTrend") } catch { $rows = @() }
-    $toolRows = @()
-    foreach ($r in $rows) {
-        if ((Get-FieldString -Object $r -PropertyName "ToolAlias") -eq $ToolAlias) { $toolRows += $r }
-    }
-    $sorted = @($toolRows | Sort-Object -Property @{ Expression = { Get-FieldString -Object $_ -PropertyName "RunDate" } })
-    $maxN = [int](Get-Threshold -Name "TrendRunCount" -DefaultValue 10)
-    if ($sorted.Count -gt $maxN) { $sorted = @($sorted[($sorted.Count - $maxN)..($sorted.Count - 1)]) }
-    if ($sorted.Count -eq 0) { return }
+    $data = Get-TrendChartData -ToolAlias $ToolAlias
+    $items = @($data.Items)
+    if ($items.Count -eq 0) { return }
 
     $sAlarm = New-Object System.Windows.Forms.DataVisualization.Charting.Series("Alarm 數")
     $sAlarm.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Column
     $sAlarm.YAxisType = [System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
     $sAlarm.Color = [System.Drawing.Color]::FromArgb(120, 149, 165, 166)
 
-    $sPl = New-Object System.Windows.Forms.DataVisualization.Charting.Series("PL peak 偏移 (nm)")
-    $sPl.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
-    $sPl.BorderWidth = 2
-    $sPl.MarkerStyle = "Circle"; $sPl.MarkerSize = 6
-    $sPl.Color = [System.Drawing.Color]::FromArgb(41, 128, 185)
+    # v1.0.12: 無 PL 資料時主線改畫 Rs (由量測總檔), Y 軸標題同步切換
+    $mainName = "PL peak 偏移 (nm)"
+    $axisTitle = "相對偏移 (%/nm)"
+    if ($data.UseRs) {
+        $mainName = "Rs 平均 (LEHI_RS)"
+        $axisTitle = "Rs (LEHI_RS 平均)"
+    }
+    try { $Chart.ChartAreas[0].AxisY.Title = $axisTitle } catch { }
+    $sMain = New-Object System.Windows.Forms.DataVisualization.Charting.Series($mainName)
+    $sMain.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
+    $sMain.BorderWidth = 2
+    $sMain.MarkerStyle = "Circle"; $sMain.MarkerSize = 6
+    $sMain.Color = [System.Drawing.Color]::FromArgb(41, 128, 185)
 
     $sThk = New-Object System.Windows.Forms.DataVisualization.Charting.Series("厚度偏差 (%)")
     $sThk.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
@@ -3549,15 +3632,22 @@ function Update-TrendChart {
     $sThk.MarkerStyle = "Square"; $sThk.MarkerSize = 6
     $sThk.Color = [System.Drawing.Color]::FromArgb(192, 57, 43)
 
-    foreach ($r in $sorted) {
-        $xLabel = Get-FieldString -Object $r -PropertyName "RunID_Alias"
-        [void]$sAlarm.Points.AddXY($xLabel, (Get-FieldInt -Object $r -PropertyName "AlarmCount" -DefaultValue 0))
-        [void]$sPl.Points.AddXY($xLabel, (Get-FieldDouble -Object $r -PropertyName "PLPeakShiftNm" -DefaultValue 0))
-        [void]$sThk.Points.AddXY($xLabel, (Get-FieldDouble -Object $r -PropertyName "ThicknessDeltaPct" -DefaultValue 0))
+    $anyAlarm = $false
+    $anyThk = $false
+    foreach ($it in $items) {
+        $x = [string]$it.RunId
+        $i1 = $sAlarm.Points.AddXY($x, $(if ($null -ne $it.Alarm) { [int]$it.Alarm } else { 0 }))
+        if ($null -eq $it.Alarm) { $sAlarm.Points[$i1].IsEmpty = $true } else { $anyAlarm = $true }
+        $mv = $null
+        if ($data.UseRs) { $mv = $it.Rs } else { $mv = $it.Pl }
+        $i2 = $sMain.Points.AddXY($x, $(if ($null -ne $mv) { [double]$mv } else { 0 }))
+        if ($null -eq $mv) { $sMain.Points[$i2].IsEmpty = $true }
+        $i3 = $sThk.Points.AddXY($x, $(if ($null -ne $it.Thk) { [double]$it.Thk } else { 0 }))
+        if ($null -eq $it.Thk) { $sThk.Points[$i3].IsEmpty = $true } else { $anyThk = $true }
     }
-    [void]$Chart.Series.Add($sAlarm)
-    [void]$Chart.Series.Add($sPl)
-    [void]$Chart.Series.Add($sThk)
+    if ($anyAlarm) { [void]$Chart.Series.Add($sAlarm) }
+    [void]$Chart.Series.Add($sMain)
+    if ($anyThk) { [void]$Chart.Series.Add($sThk) }
 }
 
 # ============================================================
@@ -4541,7 +4631,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.11
+# EOF RunPreCheckAI.ps1 v1.0.12
 
 
 
