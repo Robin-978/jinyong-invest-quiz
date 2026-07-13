@@ -25,6 +25,17 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.7  新增: 機台 Log 檔名目錄 — Import/RawImport 內的秒級 Log 檔
+          (檔名慣例 <產品>.xxx..._MAT<機台2碼><Run碼>_<流水號>.csv, 如
+          H01B9N.PRODUCT.B9N.P02069_M06_P(NGR)_MAT06261175_17155.csv):
+          (1) Get-RunLogFileInfo / Get-RunLogCatalog 由檔名解析 機台(MAT06)/
+              Run(261175)/產品(H01B9N), 診斷頁機台與 Run 下拉選單自動帶入
+              (原本僅讀 RunSummary.csv, Input 只放 Log 檔時選單為空白);
+          (2) Invoke-RunDiagnosis 支援 Log 檔名建立的 Run: RunSummary 查無此
+              Run 時改由檔名目錄補基本資料, 並自動以同機台前一 Run Log 做
+              StepCode 平均差異比對, 結果併入機台穩定度; 表格缺漏面向依既有
+              規則以保守等級呈現並列於資料不足處;
+          SelfTest 增至 99 項 (檔名解析、目錄掃描、Log Run 端到端診斷)。
    1.0.6  效能/修正: 去識別化轉換 (RawImport -> Import) 大幅加速並確保對照表落地 —
           (1) Get-DeidentAlias 類別編號改用計數快取 (原版每新增一個 alias 即全表
               掃描, 數萬個新 ID 為 O(n^2), 大檔需數十分鐘 -> 數秒);
@@ -97,7 +108,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.6"
+$script:AIVersion = "1.0.7"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -133,6 +144,7 @@ $script:AppState = @{
     Config        = $null
     LastDiagnosis = $null
     LastReportPath = ""
+    LogCatalog    = @()   # v1.0.7: Log 檔名目錄快取 (機台/Run/產品 由檔名解析)
 }
 
 # ============================================================
@@ -806,6 +818,57 @@ function Convert-AllRawImports {
         Write-AuditLog -Action "DEIDENT_CONVERT" -Detail ("{0} rows={1}" -f $f.Name, $n)
     }
     return $results
+}
+
+# ============================================================
+# 機台 Log 檔名目錄 (v1.0.7)
+# 檔名慣例: <產品>.xxx..._MAT<機台2碼><Run碼>_<流水號>.csv
+#   例: H01B9N.PRODUCT.B9N.P02069_M06_P(NGR)_MAT06261175_17155.csv
+#       -> 機台 MAT06 / Run 261175 / 產品 H01B9N
+# 供診斷頁下拉選單帶入與 Log 對 Log 自動比對 (RunSummary 未建檔時)。
+# ============================================================
+function Get-RunLogFileInfo {
+    # 解析單一 Log 檔名; 不符合慣例回傳 $null (資料表 CSV 自然被排除)
+    param([string]$FileName)
+    if ([string]::IsNullOrEmpty($FileName)) { return $null }
+    $m = [regex]::Match($FileName, '(?i)MAT(\d{2})(\d{4,})(?:_\d+)?\.csv$')
+    if (-not $m.Success) { return $null }
+    $prod = ""
+    $dot = $FileName.IndexOf('.')
+    if ($dot -gt 0) { $prod = $FileName.Substring(0, $dot) }
+    # 檔名第一段即含 MAT 碼者視為無產品前綴
+    if ($prod -match '(?i)MAT\d') { $prod = "" }
+    return @{
+        Tool    = ("MAT" + $m.Groups[1].Value)
+        RunId   = $m.Groups[2].Value
+        Product = $prod
+    }
+}
+
+function Get-RunLogCatalog {
+    <#
+      掃描 Import 與 RawImport 資料夾內符合檔名慣例的機台秒級 Log 檔,
+      回傳陣列: @{ Tool; RunId; Product; Path; FileName }
+      同一 機台|Run 以先找到者為準 (Import 優先於 RawImport)。
+    #>
+    $entries = @{}
+    $order = New-Object System.Collections.Generic.List[string]
+    foreach ($root in @((Get-ImportRootPath), (Get-RawImportRootPath))) {
+        $files = @(Get-ChildItem -LiteralPath $root -Filter "*.csv" -ErrorAction SilentlyContinue)
+        foreach ($f in $files) {
+            $info = Get-RunLogFileInfo -FileName $f.Name
+            if ($null -eq $info) { continue }
+            $key = ([string]$info.Tool) + "|" + ([string]$info.RunId)
+            if ($entries.ContainsKey($key)) { continue }
+            $info["Path"] = $f.FullName
+            $info["FileName"] = $f.Name
+            $entries[$key] = $info
+            [void]$order.Add($key)
+        }
+    }
+    $list = @()
+    foreach ($k in $order) { $list += $entries[$k] }
+    return $list
 }
 
 # ============================================================
@@ -1904,7 +1967,26 @@ function Invoke-RunDiagnosis {
     $caseRows  = @(Get-DataRows -TableName "HistoryCases")
 
     $runRow = Find-RowByRun -Rows $runRows -RunAlias $RunAlias
-    if ($null -eq $runRow) { throw ("找不到 Run 基本資料: " + $RunAlias) }
+
+    # v1.0.7: RunSummary 查無此 Run 時, 改由機台 Log 檔名目錄建立基本資料
+    # (Input 僅放秒級 Log 檔的情境: 機台/Run/產品 由檔名解析)
+    $logEntry = $null
+    $logCatalog = @()
+    if ($null -eq $runRow) {
+        $logCatalog = @(Get-RunLogCatalog)
+        foreach ($e in $logCatalog) {
+            if ([string]$e.RunId -eq $RunAlias) { $logEntry = $e; break }
+        }
+        if ($null -eq $logEntry) { throw ("找不到 Run 基本資料: " + $RunAlias) }
+        $runRow = @{
+            RunID_Alias   = $RunAlias
+            ToolAlias     = [string]$logEntry.Tool
+            ProductFamily = [string]$logEntry.Product
+            ChamberAlias  = ""
+            RecipeFamily  = ""
+            RunStartTime  = ""
+        }
+    }
 
     $toolAlias = Get-FieldString -Object $runRow -PropertyName "ToolAlias"
     $pf        = Get-FieldString -Object $runRow -PropertyName "ProductFamily"
@@ -1944,6 +2026,23 @@ function Invoke-RunDiagnosis {
     }
     $prevPrevRunAlias = ""
     if ($null -ne $prevPrevRunRow) { $prevPrevRunAlias = Get-FieldString -Object $prevPrevRunRow -PropertyName "RunID_Alias" }
+
+    # v1.0.7: Log 檔名目錄模式 — 以同機台 Run 碼數字排序推得前一 / 上上 Run
+    $prevLogEntry = $null
+    if ($null -ne $logEntry) {
+        $thisId = [long]$RunAlias
+        $earlier = @()
+        foreach ($e in $logCatalog) {
+            if ([string]$e.Tool -ne $toolAlias) { continue }
+            if ([long]$e.RunId -lt $thisId) { $earlier += $e }
+        }
+        $earlier = @($earlier | Sort-Object -Property @{ Expression = { [long]$_.RunId }; Descending = $true })
+        if ($earlier.Count -ge 1) {
+            $prevLogEntry = $earlier[0]
+            $prevRunAlias = [string]$earlier[0].RunId
+        }
+        if ($earlier.Count -ge 2) { $prevPrevRunAlias = [string]$earlier[1].RunId }
+    }
 
     # 特徵資料:
     #   機台面 (ToolStability / Maintenance): 以「前一 Run (N-1)」為主 — Log 可即時取得
@@ -1985,8 +2084,36 @@ function Invoke-RunDiagnosis {
         $missing.Items += ("缺少上上 Run (N-2) 量測資料 (ProductDrift: " + $prevPrevRunAlias + ")")
     }
 
+    # v1.0.7: Log 檔名目錄模式 — 自動以本 Run Log vs 前一 Run Log 做
+    # StepCode 平均差異比對, 結果併入機台穩定度 (機台行為面提前預警)
+    if ($null -ne $logEntry) {
+        if ($null -ne $prevLogEntry) {
+            try {
+                $tSel  = Get-StepCodeMeanTable -LogPath ([string]$logEntry.Path)
+                $tPrev = Get-StepCodeMeanTable -LogPath ([string]$prevLogEntry.Path)
+                $lw = Get-Threshold -Name "LogDeltaWarnPct" -DefaultValue 3.0
+                $lh = Get-Threshold -Name "LogDeltaHighPct" -DefaultValue 8.0
+                $lm = [int](Get-Threshold -Name "LogCompareMinSec" -DefaultValue 5)
+                $lt = [int](Get-Threshold -Name "LogCompareTopN"   -DefaultValue 10)
+                $logCmp = Compare-StepCodeMeanTables -BaseTable $tPrev -TestTable $tSel `
+                    -BaseName ("前一 Run " + [string]$prevLogEntry.RunId) -TestName ("Run " + $RunAlias) `
+                    -WarnPct $lw -HighPct $lh -MinSec $lm -TopN $lt
+                foreach ($x in $logCmp.Reasons) { $stab.Reasons += ("(Log 比對) " + $x) }
+                if ($logCmp.Level -gt $stab.Level) { $stab.Level = $logCmp.Level }
+            } catch {
+                $missing.Items += ("Log 檔比對失敗: " + $_.Exception.Message)
+            }
+        } else {
+            $missing.Items += "同機台無更早的 Log 檔, 無法進行本 Run vs 前一 Run 秒級 Log 比對"
+        }
+        $missing.Items += "此 Run 由 Log 檔名建立, RunSummary / ToolStability / Maintenance / ProductDrift 尚無對應資料"
+    }
+
     $overall = @{ Level = (Measure-MaxRisk @($stab.Level, $maint.Level, $drift.Level)); Reasons = @() }
     Get-ContextChecks -RunRow $runRow -Result $overall
+    if ($null -ne $logEntry) {
+        $overall.Reasons += ("(資料來源) 本 Run 資訊由 Log 檔名解析建立 (檔案: {0}); 表格資料備齊前, 缺漏面向以保守等級與 Log 比對呈現。" -f [string]$logEntry.FileName)
+    }
 
     # 相似案例
     $riskCats = @()
@@ -2040,7 +2167,11 @@ function Invoke-RunDiagnosis {
         Checks        = $checks
         MissingData   = $missing.Items
         SimilarCases  = $similar
-        DataSources   = @("RunSummary", "ToolStability", "Maintenance", "ProductDrift", "HistoryCases")
+        DataSources   = $(if ($null -ne $logEntry) {
+                            @("RunLog 檔名目錄 (" + [string]$logEntry.FileName + ")", "RunSummary", "ToolStability", "Maintenance", "ProductDrift", "HistoryCases")
+                          } else {
+                            @("RunSummary", "ToolStability", "Maintenance", "ProductDrift", "HistoryCases")
+                          })
         GeneratedAt   = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
         AIVersion     = $script:AIVersion
     }
@@ -2592,6 +2723,34 @@ function Invoke-SelfTest {
     & $assert ($report2.Contains("量測資料來源 Run:RUN_A")) "N-2 診斷: 報告註明量測來源 Run"
     & $assert ($report2.Contains("上上 Run:RUN_A")) "N-2 診斷: 報告標頭含上上 Run"
 
+    # --- 17. 機台 Log 檔名目錄 (v1.0.7): 檔名帶入 機台/Run/產品 與端到端診斷 ---
+    $fi = Get-RunLogFileInfo -FileName "H01B9N.PRODUCT.B9N.P02069_M06_P(NGR)_MAT06261175_17155.csv"
+    & $assert ($null -ne $fi -and $fi.Tool -eq "MAT06" -and $fi.RunId -eq "261175" -and $fi.Product -eq "H01B9N") "LogCatalog: 檔名解析 機台/Run/產品"
+    & $assert ($null -eq (Get-RunLogFileInfo -FileName "RunSummary.csv")) "LogCatalog: 資料表檔不誤判為 Log"
+
+    # 建兩個同機台 Log 檔 (本 Run Step2 Temp +10%) 供目錄掃描與診斷
+    $mkMatLog = {
+        param([string]$Name, [double]$T2)
+        $lines = @("Timestamp,Step,Stepcode_s,Temp,Flow")
+        for ($i = 0; $i -lt 6; $i++) { $lines += ("10:00:0{0},1,11,100,50" -f $i) }
+        for ($i = 0; $i -lt 6; $i++) { $lines += ("10:01:0{0},2,22,{1},80" -f $i, $T2.ToString([System.Globalization.CultureInfo]::InvariantCulture)) }
+        $p = Join-Path $script:ImportRoot $Name
+        Write-AllTextUtf8 -Path $p -Text ($lines -join [Environment]::NewLine)
+    }
+    & $mkMatLog "H01B9N.PRODUCT.B9N.P02069_M06_P(NGR)_MAT06261174_17154.csv" 200.0
+    & $mkMatLog "H01B9N.PRODUCT.B9N.P02069_M06_P(NGR)_MAT06261175_17155.csv" 220.0
+    $cat = @(Get-RunLogCatalog)
+    $mat06 = @()
+    foreach ($e in $cat) { if ($e.Tool -eq "MAT06") { $mat06 += $e } }
+    & $assert ($mat06.Count -eq 2) "LogCatalog: 目錄掃描找到 2 個 MAT06 Run"
+
+    $dLog = Invoke-RunDiagnosis -RunAlias "261175"
+    & $assert ($dLog.ToolAlias -eq "MAT06" -and $dLog.ProductFamily -eq "H01B9N") "LogCatalog: 診斷帶入機台與產品"
+    & $assert ($dLog.PrevRunAlias -eq "261174") "LogCatalog: 前一 Run 由檔名數字排序推得"
+    $hasLogCmpReason = $false
+    foreach ($x in $dLog.Stability.Reasons) { if ($x.StartsWith("(Log 比對)")) { $hasLogCmpReason = $true; break } }
+    & $assert ($hasLogCmpReason -and $dLog.Stability.Level -ge 3) "LogCatalog: Log 比對併入穩定度 (Temp +10% -> 高)"
+
     # --- 收尾 ---
     Write-Host ""
     Write-Host ("SelfTest 結果: PASS={0} FAIL={1}" -f $t.Pass, $t.Fail)
@@ -2940,6 +3099,17 @@ function Build-DiagnosisTab {
             foreach ($r in $sorted) {
                 [void]$cbRun.Items.Add((Get-FieldString -Object $r -PropertyName "RunID_Alias"))
             }
+            # v1.0.7: 併入 Log 檔名目錄的 Run (顯示 "Run碼 | 產品", 新到舊)
+            $cat = @()
+            if ($null -ne $St.LogCatalog) { $cat = @($St.LogCatalog) }
+            $logRuns = @()
+            foreach ($e in $cat) { if ([string]$e.Tool -eq $tool) { $logRuns += $e } }
+            $logRuns = @($logRuns | Sort-Object -Property @{ Expression = { [long]$_.RunId }; Descending = $true })
+            foreach ($e in $logRuns) {
+                $txt = [string]$e.RunId
+                if (-not [string]::IsNullOrEmpty([string]$e.Product)) { $txt = $txt + " | " + [string]$e.Product }
+                if (-not $cbRun.Items.Contains($txt)) { [void]$cbRun.Items.Add($txt) }
+            }
             if ($cbRun.Items.Count -gt 0) { $cbRun.SelectedIndex = 0 }
         } catch {
             Write-ErrorLog ("fillRunCombo failed: " + $_.Exception.Message)
@@ -2953,6 +3123,15 @@ function Build-DiagnosisTab {
             $seen = @{}
             foreach ($r in $rows) {
                 $tl = Get-FieldString -Object $r -PropertyName "ToolAlias"
+                if (-not [string]::IsNullOrEmpty($tl) -and -not $seen.ContainsKey($tl)) {
+                    $seen[$tl] = $true
+                    [void]$cbTool.Items.Add($tl)
+                }
+            }
+            # v1.0.7: 併入 Log 檔名目錄的機台 (Input 僅放 Log 檔時選單不再空白)
+            $St.LogCatalog = @(Get-RunLogCatalog)
+            foreach ($e in $St.LogCatalog) {
+                $tl = [string]$e.Tool
                 if (-not [string]::IsNullOrEmpty($tl) -and -not $seen.ContainsKey($tl)) {
                     $seen[$tl] = $true
                     [void]$cbTool.Items.Add($tl)
@@ -3027,6 +3206,8 @@ function Build-DiagnosisTab {
         try {
             $runAlias = [string]$cbRun.SelectedItem
             if ([string]::IsNullOrEmpty($runAlias)) { Show-Warn "請先選擇 Run。"; return }
+            # v1.0.7: Log 檔名目錄項目顯示為 "Run碼 | 產品", 取 Run 碼部分
+            $runAlias = $runAlias.Split('|')[0].Trim()
             $d = Invoke-RunDiagnosis -RunAlias $runAlias
             $St.LastDiagnosis = $d
             $St.LastReportPath = ""
@@ -3699,7 +3880,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.6
+# EOF RunPreCheckAI.ps1 v1.0.7
 
 
 
