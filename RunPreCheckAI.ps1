@@ -25,6 +25,11 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.16 修正: 資料表管理欄位全擠在一欄 — 標頭解析誤將 Split-CsvLineFields
+          的逗號包裝回傳再以 @() 包一層, 欄名陣列變成單一巢狀元素
+          (顯示為空白連接的一整串)。抽出 Read-CsvHeaderColumns (逐元素
+          回傳, 呼叫端以 @() 收集, 與全檔慣例一致) 並由管理介面使用;
+          SelfTest 增至 131 項 (標頭欄數/型別回歸)。
    1.0.15 新增: 資料表管理介面 — 設定頁「資料表管理」按鈕 (Admin/Engineer):
           RunSummary / ToolStability / Maintenance / ProductDrift /
           MeasurementTrend / HistoryCases 六張 Data\Import 資料表的
@@ -200,7 +205,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.15"
+$script:AIVersion = "1.0.16"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -1019,6 +1024,24 @@ $script:ImportTableHeaders = @{
     "HistoryCases.csv"     = "CaseID,ToolAlias,ProductFamily,RiskCategory,Keywords,Summary,Action,Outcome,CaseDate"
 }
 function Get-ImportTableHeaders { return $script:ImportTableHeaders }
+
+function Read-CsvHeaderColumns {
+    <#
+      讀 CSV 檔的標頭列 -> 欄名清單 (跳過前置空白行, 各欄名 Trim)。
+      逐元素輸出, 呼叫端以 @() 收集 (勿對 Split-CsvLineFields 的逗號包裝
+      回傳再包 @(), 會變成巢狀陣列 — v1.0.16 修正之資料表管理欄位問題)。
+    #>
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $sr = New-Object System.IO.StreamReader($Path, [System.Text.Encoding]::UTF8, $true)
+    try {
+        $hl = $sr.ReadLine()
+        while ($null -ne $hl -and $hl.Trim().Length -eq 0) { $hl = $sr.ReadLine() }
+        if ([string]::IsNullOrEmpty($hl)) { return }
+        $cols = Split-CsvLineFields -Line $hl
+        foreach ($c in $cols) { Write-Output ([string]$c).Trim() }
+    } finally { $sr.Dispose() }
+}
 
 function Initialize-ImportTableTemplates {
     $templates = Get-ImportTableHeaders
@@ -3556,6 +3579,11 @@ function Invoke-SelfTest {
     $mtHdrLine = ((Read-AllTextUtf8 -Path (Join-Path $script:ImportRoot "MeasurementTrend.csv")) -split "`r?`n")[0].Trim()
     & $assert ($mtHdrLine -eq [string]$hdrs["MeasurementTrend.csv"]) "資料表管理: 範本檔標頭與定義一致"
 
+    # --- 26. 標頭欄位解析 (v1.0.16): 欄位全擠一欄回歸 ---
+    $mHdrCols = @(Read-CsvHeaderColumns -Path (Join-Path $script:ImportRoot "Maintenance.csv"))
+    & $assert ($mHdrCols.Count -eq 9 -and $mHdrCols[1] -eq "ToolAlias") "標頭解析: 欄數與欄名正確 (9 欄)"
+    & $assert ($mHdrCols[0] -is [string] -and $mHdrCols[0] -eq "RunID_Alias") "標頭解析: 各元素為單一欄名字串 (非巢狀陣列)"
+
     # --- 收尾 ---
     Write-Host ""
     Write-Host ("SelfTest 結果: PASS={0} FAIL={1}" -f $t.Pass, $t.Fail)
@@ -4377,15 +4405,8 @@ function Show-TableManagerDialog {
             $grid.Rows.Clear()
             $grid.Columns.Clear()
             $path = Join-Path (Get-ImportRootPath) ($name + ".csv")
-            $header = @()
-            if (Test-Path -LiteralPath $path) {
-                $sr = New-Object System.IO.StreamReader($path, [System.Text.Encoding]::UTF8, $true)
-                try {
-                    $hl = $sr.ReadLine()
-                    while ($null -ne $hl -and $hl.Trim().Length -eq 0) { $hl = $sr.ReadLine() }
-                    if (-not [string]::IsNullOrEmpty($hl)) { $header = @(Split-CsvLineFields -Line $hl) }
-                } finally { $sr.Dispose() }
-            }
+            # v1.0.16: 標頭以 Read-CsvHeaderColumns 取得 (逐元素收集, 修正欄位全擠一欄)
+            $header = @(Read-CsvHeaderColumns -Path $path)
             $hdrMap = Get-ImportTableHeaders
             if ($header.Count -eq 0 -and $hdrMap.ContainsKey($name + ".csv")) {
                 $header = ([string]$hdrMap[$name + ".csv"]).Split(',')
@@ -4994,7 +5015,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.15
+# EOF RunPreCheckAI.ps1 v1.0.16
 
 
 
