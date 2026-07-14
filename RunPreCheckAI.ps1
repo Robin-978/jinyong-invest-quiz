@@ -25,6 +25,15 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.14 修正 (依現場回饋): Log 分組鍵改以 StepLabel 為主 —
+          StepLabel 才是真正對應到實際磊晶 Layer 的欄位 (同一 Layer 可
+          橫跨多個 Step 編號; 不同 Run 的 Step 編號可能位移):
+          (1) Get-StepCodeMeanTable 分組鍵優先順序改為
+              StepLabel -> Step -> Stepcode_s -> StepCode_SP
+              (C# 快速引擎與純 PS 退回模式一致; 無 StepLabel 的舊 Log
+              自動退回原行為); StepLabel 不列入數值比對欄;
+          (2) 比對原因與差異排行顯示文字改「Step/Layer」;
+          SelfTest 增至 127 項 (StepLabel 分組/跨 Step 合併/退回模式)。
    1.0.13 修正/新增 (依現場回饋 3 項):
           (1) 趨勢圖停在舊 Run — Get-TrendChartData 改為 MeasurementTrend
               表與量測總檔目錄「聯集」: 表未更新 (如檔案被 Excel 鎖住致
@@ -181,7 +190,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.13"
+$script:AIVersion = "1.0.14"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -1685,21 +1694,22 @@ function Get-StepCodeMeanTableFallback {
 
         $groupIdx = -1
         $groupCol = ""
-        foreach ($cand in @("Step", "Stepcode_s", "StepCode_SP")) {
+        # v1.0.14: StepLabel 優先 (對應真實 Layer)
+        foreach ($cand in @("StepLabel", "Step", "Stepcode_s", "StepCode_SP")) {
             for ($i = 0; $i -lt $cols.Length; $i++) {
                 if ($cols[$i] -ceq $cand) { $groupIdx = $i; $groupCol = $cols[$i]; break }
             }
             if ($groupIdx -ge 0) { break }
         }
         if ($groupIdx -lt 0) {
-            throw "Log 檔缺少分組欄位 (Step / Stepcode_s / StepCode_SP), 無法計算 StepCode 平均。"
+            throw "Log 檔缺少分組欄位 (StepLabel / Step / Stepcode_s / StepCode_SP), 無法計算 StepCode 平均。"
         }
         $stepcodeIdx = -1
         for ($i = 0; $i -lt $cols.Length; $i++) {
             if ($cols[$i] -ceq "Stepcode_s") { $stepcodeIdx = $i; break }
         }
 
-        $metaCols = @("Timestamp", "Step", "Stepcode_s")
+        $metaCols = @("Timestamp", "StepLabel", "Step", "Stepcode_s")
         $numIdx = New-Object System.Collections.Generic.List[int]
         $numCols = New-Object System.Collections.Generic.List[string]
         for ($i = 0; $i -lt $cols.Length; $i++) {
@@ -1779,7 +1789,9 @@ function Get-StepCodeMeanTableFallback {
 function Get-StepCodeMeanTable {
     <#
       將以秒計的 Run Log CSV 依 StepCode 分組, 計算每個數值欄位的平均值。
-      - 分組鍵優先順序: Step -> Stepcode_s -> StepCode_SP (依實際欄位存在者)
+      - 分組鍵優先順序: StepLabel -> Step -> Stepcode_s -> StepCode_SP
+        (v1.0.14: StepLabel 才是對應真實磊晶 Layer 的欄位, 同一 Layer 可
+        橫跨多個 Step 編號; 無 StepLabel 的舊 Log 依序退回)
       - 分組鍵空白的列歸入 "(blank)" 群組 (常見於 Log 缺 Stepcode 標記)
       - 非數值 / 空白儲存格略過不計; 該群組全數無法解析時平均為 $null
       - 僅做數學平均, 不判定好壞 (AI 權限邊界: 整理/比對, 不放行)
@@ -1800,10 +1812,11 @@ function Get-StepCodeMeanTable {
 
     $agg = $null
     try {
+        # v1.0.14: StepLabel 優先 (對應真實 Layer); StepLabel 亦列入 meta 欄不做數值比對
         $agg = [RunPreCheckAI.StepMeanAggregator]::Aggregate(
             $LogPath,
-            [string[]]@("Step", "Stepcode_s", "StepCode_SP"),
-            [string[]]@("Timestamp", "Step", "Stepcode_s"))
+            [string[]]@("StepLabel", "Step", "Stepcode_s", "StepCode_SP"),
+            [string[]]@("Timestamp", "StepLabel", "Step", "Stepcode_s"))
     } catch {
         $ex = $_.Exception
         while ($null -ne $ex -and -not ($ex -is [System.IO.InvalidDataException]) -and $null -ne $ex.InnerException) {
@@ -1812,7 +1825,7 @@ function Get-StepCodeMeanTable {
         if ($ex -is [System.IO.InvalidDataException]) {
             switch ($ex.Message) {
                 "NO_DATA"            { throw ("Log 檔無資料: " + $LogPath) }
-                "NO_GROUP_COLUMN"    { throw "Log 檔缺少分組欄位 (Step / Stepcode_s / StepCode_SP), 無法計算 StepCode 平均。" }
+                "NO_GROUP_COLUMN"    { throw "Log 檔缺少分組欄位 (StepLabel / Step / Stepcode_s / StepCode_SP), 無法計算 StepCode 平均。" }
                 "NO_NUMERIC_COLUMNS" { throw "Log 檔無可計算的數值欄位。" }
                 default              { throw }
             }
@@ -1985,7 +1998,7 @@ function Compare-StepCodeMeanTables {
         $thName = "警戒"
         $thVal = $WarnPct
         if ($d.Level -ge 3) { $thName = "高風險"; $thVal = $HighPct }
-        Add-RiskReason -Result $r -Level $d.Level -Reason ("Step {0} 參數 {1}: {2} 平均 {3} vs {4} 平均 {5}, 差異 {6}% 超過{7}門檻 {8}%。" -f `
+        Add-RiskReason -Result $r -Level $d.Level -Reason ("Step/Layer {0} 參數 {1}: {2} 平均 {3} vs {4} 平均 {5}, 差異 {6}% 超過{7}門檻 {8}%。" -f `
             $d.StepKey, $d.Param, $TestName, $d.TestMean.ToString("0.####", $inv), $BaseName, $d.BaseMean.ToString("0.####", $inv), `
             $d.DeltaPct.ToString("+0.##;-0.##", $inv), $thName, $thVal)
         $listed++
@@ -2091,7 +2104,7 @@ function Invoke-PreRunLogDiagnosis {
         if (@($Cmp.TopDeltas).Count -gt 0) {
             [void]$sb.AppendLine("差異排行 (|差異%| 由大到小):")
             foreach ($d in $Cmp.TopDeltas) {
-                [void]$sb.AppendLine(("  Step {0} | {1} | 基準 {2} | N-1 {3} | 差異 {4}% | 等級 {5}" -f `
+                [void]$sb.AppendLine(("  Step/Layer {0} | {1} | 基準 {2} | N-1 {3} | 差異 {4}% | 等級 {5}" -f `
                     $d.StepKey, $d.Param, $d.BaseMean.ToString("0.####", $inv), $d.TestMean.ToString("0.####", $inv), `
                     $d.DeltaPct.ToString("+0.##;-0.##", $inv), (Get-RiskName $d.Level)))
             }
@@ -2813,7 +2826,7 @@ function New-DiagnosisReportText {
         $invLc = [System.Globalization.CultureInfo]::InvariantCulture
         [void]$sb.AppendLine("Log 比對差異排行 (|差異%| 由大到小):")
         foreach ($dd in $logCmpRpt.TopDeltas) {
-            [void]$sb.AppendLine(("  Step {0} | {1} | 前一 Run {2} | 本 Run {3} | 差異 {4}% | 等級 {5}" -f `
+            [void]$sb.AppendLine(("  Step/Layer {0} | {1} | 前一 Run {2} | 本 Run {3} | 差異 {4}% | 等級 {5}" -f `
                 $dd.StepKey, $dd.Param, $dd.BaseMean.ToString("0.####", $invLc), $dd.TestMean.ToString("0.####", $invLc), `
                 $dd.DeltaPct.ToString("+0.##;-0.##", $invLc), (Get-RiskName $dd.Level)))
         }
@@ -3507,6 +3520,20 @@ function Invoke-SelfTest {
     $t2Items = @($trend2.Items)
     $t2Last = $t2Items[$t2Items.Count - 1]
     & $assert ([string]$t2Last.RunId -eq "261176" -and $null -ne $t2Last.Rs) "趨勢圖: 表未更新時仍聯集量測總檔新 Run"
+
+    # --- 24. StepLabel 分組 (v1.0.14): StepLabel 對應真實 Layer ---
+    $logLabel = Join-Path $script:RawImportRoot "SecLog_label.csv"
+    $lblLines = @("Timestamp,Step,StepLabel,Stepcode_s,Temp,Flow")
+    for ($i = 0; $i -lt 6; $i++) { $lblLines += ("10:00:0{0},1,Buffer,11,100,50" -f $i) }
+    for ($i = 0; $i -lt 6; $i++) { $lblLines += ("10:01:0{0},2,Buffer,12,110,50" -f $i) }
+    for ($i = 0; $i -lt 6; $i++) { $lblLines += ("10:02:0{0},3,QW,21,200,80" -f $i) }
+    Write-AllTextUtf8 -Path $logLabel -Text ($lblLines -join [Environment]::NewLine)
+    $tLbl = Get-StepCodeMeanTable -LogPath $logLabel
+    & $assert ($tLbl.GroupColumn -eq "StepLabel" -and $tLbl.Order.Count -eq 2 -and $tLbl.Groups["Buffer"].N -eq 12) "StepLabel: 依 StepLabel 分組 (跨 Step 合併同 Layer)"
+    & $assert ([math]::Abs([double]$tLbl.Groups["Buffer"].Mean["Temp"] - 105) -lt 1e-9 -and `
+               (@($tLbl.NumCols) -notcontains "StepLabel") -and (@($tLbl.NumCols) -notcontains "Step")) "StepLabel: Layer 平均正確且標籤欄不列入數值比對"
+    $tLblFb = Get-StepCodeMeanTableFallback -LogPath $logLabel
+    & $assert ($tLblFb.GroupColumn -eq "StepLabel" -and [math]::Abs([double]$tLblFb.Groups["QW"].Mean["Temp"] - 200) -lt 1e-9) "StepLabel: 退回模式同樣依 StepLabel 分組"
 
     # --- 收尾 ---
     Write-Host ""
@@ -4745,7 +4772,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.13
+# EOF RunPreCheckAI.ps1 v1.0.14
 
 
 
