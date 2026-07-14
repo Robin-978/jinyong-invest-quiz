@@ -25,6 +25,11 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.18 修正 (依現場回饋): 趨勢圖 Y 軸上下限取最適 — 原固定自 0 起算,
+          Rs ~8.7 的走勢被壓成貼頂平線看不出變化。主 Y 軸 (Rs/PL/厚度)
+          改依實際資料範圍加 10% 邊距設定上下限 (單一值時加 5% 或 0.5);
+          Alarm 數副軸維持自 0 起算 (計數語意)。範圍計算抽出
+          Get-TrendAxisRange 供自我測試。SelfTest 增至 137 項。
    1.0.17 新增 (依現場回饋):
           (1) MeasurementTrend 加 RsDeltaPct 欄 — 既有表自動遷移加欄
               (既有列補空值, 寫檔前備份), 自動補列時計算 Rs 對前一量測
@@ -218,7 +223,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.17"
+$script:AIVersion = "1.0.18"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -3740,6 +3745,16 @@ function Invoke-SelfTest {
     $pdDriftText = ($dPd.Drift.Reasons -join " | ")
     & $assert ($dPd.DriftSourceRun -eq "261173" -and $pdDriftText.Contains("量測最終判定") -and $dPd.Drift.Level -ge 3) "產品飄移: 建表後 PF Fail 高風險與來源 Run 保留"
 
+    # --- 28. 趨勢圖 Y 軸上下限取最適 (v1.0.18) ---
+    $trendAx = Get-TrendChartData -ToolAlias "MAT06"
+    $rngAx = Get-TrendAxisRange -Items @($trendAx.Items) -UseRs ([bool]$trendAx.UseRs)
+    & $assert ($null -ne $rngAx -and [double]$rngAx.Min -gt 6.0 -and [double]$rngAx.Min -lt 6.5 -and `
+               [double]$rngAx.Max -gt 6.7 -and [double]$rngAx.Max -lt 7.0) "趨勢圖Y軸: 依資料範圍取最適 (不從 0 開始)"
+    $flatItems = @(@{ RunId = "1"; RunDate = ""; Alarm = $null; Pl = $null; Thk = $null; Rs = 8.7 })
+    $rngFlat = Get-TrendAxisRange -Items $flatItems -UseRs $true
+    & $assert ($null -ne $rngFlat -and [double]$rngFlat.Min -lt 8.7 -and [double]$rngFlat.Max -gt 8.7 -and `
+               [double]$rngFlat.Min -gt 0) "趨勢圖Y軸: 單一值加邊距 (平線可見)"
+
     # --- 收尾 ---
     Write-Host ""
     Write-Host ("SelfTest 結果: PASS={0} FAIL={1}" -f $t.Pass, $t.Fail)
@@ -3938,10 +3953,40 @@ function Get-TrendChartData {
     return @{ Items = $sorted; UsePl = $usePl; UseRs = ((-not $usePl) -and $anyRs) }
 }
 
+function Get-TrendAxisRange {
+    <#
+      趨勢圖主 Y 軸上下限 (v1.0.18): 依實際資料範圍加 10% 邊距, 不從 0 開始
+      (Rs ~8.7 的走勢在 0~10 軸上會被壓成平線)。單一值時加 5% 或至少 0.5。
+      回傳 $null (無資料) 或 @{ Min; Max }
+    #>
+    param([object[]]$Items, [bool]$UseRs)
+    $minV = [double]::MaxValue
+    $maxV = [double]::MinValue
+    foreach ($it in $Items) {
+        $mv = $null
+        if ($UseRs) { $mv = $it.Rs } else { $mv = $it.Pl }
+        foreach ($v in @($mv, $it.Thk)) {
+            if ($null -ne $v) {
+                if ([double]$v -lt $minV) { $minV = [double]$v }
+                if ([double]$v -gt $maxV) { $maxV = [double]$v }
+            }
+        }
+    }
+    if ($minV -gt $maxV) { return $null }
+    $pad = ($maxV - $minV) * 0.1
+    if ($pad -lt 1e-6) { $pad = [math]::Max(0.5, [math]::Abs($maxV) * 0.05) }
+    return @{ Min = [math]::Round($minV - $pad, 3); Max = [math]::Round($maxV + $pad, 3) }
+}
+
 function Update-TrendChart {
     param([object]$Chart, [string]$ToolAlias)
     if ($null -eq $Chart) { return }
     $Chart.Series.Clear()
+    # v1.0.18: 先重設主 Y 軸為自動 (NaN), 避免沿用前一機台的上下限
+    try {
+        $Chart.ChartAreas[0].AxisY.Minimum = [double]::NaN
+        $Chart.ChartAreas[0].AxisY.Maximum = [double]::NaN
+    } catch { }
     $data = Get-TrendChartData -ToolAlias $ToolAlias
     $items = @($data.Items)
     if ($items.Count -eq 0) { return }
@@ -3987,6 +4032,18 @@ function Update-TrendChart {
     if ($anyAlarm) { [void]$Chart.Series.Add($sAlarm) }
     [void]$Chart.Series.Add($sMain)
     if ($anyThk) { [void]$Chart.Series.Add($sThk) }
+
+    # v1.0.18: 主 Y 軸上下限取最適 (Alarm 數副軸維持自 0 起算)
+    $rng = Get-TrendAxisRange -Items $items -UseRs ([bool]$data.UseRs)
+    if ($null -ne $rng) {
+        try {
+            $ax = $Chart.ChartAreas[0].AxisY
+            $ax.IsStartedFromZero = $false
+            $ax.Minimum = [double]$rng.Min
+            $ax.Maximum = [double]$rng.Max
+            $ax.Interval = 0   # 0 = 刻度自動
+        } catch { }
+    }
 }
 
 # ============================================================
@@ -5171,7 +5228,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.17
+# EOF RunPreCheckAI.ps1 v1.0.18
 
 
 
