@@ -25,6 +25,18 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.13 修正/新增 (依現場回饋 3 項):
+          (1) 趨勢圖停在舊 Run — Get-TrendChartData 改為 MeasurementTrend
+              表與量測總檔目錄「聯集」: 表未更新 (如檔案被 Excel 鎖住致
+              補列失敗) 時, 圖仍即時涵蓋量測總檔內全部 Run (取最近 N 筆);
+              排序改以 Run 碼數字為主 (皆為數字時), 不受日期格式影響;
+          (2) Dop1 變化量大掩蓋其他警訊 — 新增設定 LogCompareExcludeParams
+              (萬用字元樣式, 分號分隔; 預設 "Dop1.*" 依現場指示):
+              Log 比對時排除指定參數不列入, 報告註記排除清單以留痕;
+              「編輯設定」對話框可直接修改 (亦可加 Hyd1.*;*.dp_SP 等);
+          (3) 主診斷報告補「Log 比對差異排行」小節 (原僅前 Run Log 診斷
+              對話框報告有排行, 主報告的「詳見差異排行」無處可看);
+          SelfTest 增至 124 項。
    1.0.12 新增 (依現場回饋): 趨勢圖無 PL 資料時改畫 Rs —
           部分產品不量 PL (AGA/IGA 空白), 原趨勢圖 PL 線恆為空。
           (1) 新增 Get-TrendChartData (資料與 UI 分離, 可自我測試):
@@ -169,7 +181,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.12"
+$script:AIVersion = "1.0.13"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -509,6 +521,10 @@ function Get-DefaultConfig {
             Enabled = $false        # Layer 3 LLM 介面預留, 預設停用 (資安: 不外送)
             Note    = "啟用前須通過資安審核, 且僅允許送出去識別化相對值資料"
         }
+        # Log 比對排除參數 (v1.0.13): 萬用字元樣式, 分號/逗號分隔。
+        # 不是所有 Device 參數都需比對 — 依現場指示預設排除 Dop1 (近零噪音
+        # 掩蓋其他警訊); 可於「編輯設定」加入如 Hyd1.*;*.dp_SP;*.dp_MV
+        LogCompareExcludeParams = "Dop1.*"
         Thresholds = @{
             StabilityScoreMedium   = 85     # 任一穩定分數低於此 -> Medium
             StabilityScoreHigh     = 70     # 任一穩定分數低於此 -> High
@@ -601,6 +617,18 @@ function Save-AppConfig {
     $json = ConvertTo-Json -InputObject $cfg -Depth 10
     Write-FileSafe -Path $script:ConfigPath -Text $json
     Write-AuditLog -Action "CONFIG_SAVED" -Detail "config.json updated"
+}
+
+function Get-LogCompareExcludePatterns {
+    # Log 比對排除參數樣式清單 (config.LogCompareExcludeParams; 分號/逗號分隔)
+    $cfg = $script:AppState.Config
+    $s = [string](Get-ObjectPropertyValueSafe -Object $cfg -PropertyName "LogCompareExcludeParams" -DefaultValue "")
+    $pats = @()
+    foreach ($p in $s.Split([char[]]@(';', ','))) {
+        $t = $p.Trim()
+        if ($t.Length -gt 0) { $pats += $t }
+    }
+    return $pats
 }
 
 function Get-Threshold {
@@ -1874,7 +1902,8 @@ function Compare-StepCodeMeanTables {
         [string]$BaseName, [string]$TestName,
         [double]$WarnPct, [double]$HighPct,
         [int]$MinSec = 5, [int]$TopN = 10,
-        [double]$MinBaseAbs = 0.0   # v1.0.9: 基準平均絕對值低於此者略過 (濾近零參數噪音)
+        [double]$MinBaseAbs = 0.0,   # v1.0.9: 基準平均絕對值低於此者略過 (濾近零參數噪音)
+        [string[]]$ExcludeParams = @()   # v1.0.13: 排除參數樣式 (萬用字元; 如 Dop1.*)
     )
 
     $r = @{
@@ -1883,9 +1912,18 @@ function Compare-StepCodeMeanTables {
         BaseName = $BaseName; TestName = $TestName
     }
 
-    # 共同數值欄位
+    # 共同數值欄位 (v1.0.13: 依設定排除指定參數 — 不是所有 Device 參數都需比對)
     $commonCols = @()
-    foreach ($c in $TestTable.NumCols) { if (@($BaseTable.NumCols) -contains $c) { $commonCols += $c } }
+    $excludedCols = @()
+    foreach ($c in $TestTable.NumCols) {
+        if (@($BaseTable.NumCols) -notcontains $c) { continue }
+        $skip = $false
+        foreach ($pat in $ExcludeParams) {
+            if ($c -like $pat) { $skip = $true; break }
+        }
+        if ($skip) { $excludedCols += $c } else { $commonCols += $c }
+    }
+    $r["ExcludedParams"] = $excludedCols
     if ($commonCols.Count -eq 0) {
         Add-RiskReason -Result $r -Level 1 -Reason ("{0} 與 {1} 無共同參數欄位, 無法比對 (請確認 Log 欄位格式)。" -f $TestName, $BaseName)
         return $r
@@ -1958,6 +1996,10 @@ function Compare-StepCodeMeanTables {
     if ($r.Reasons.Count -eq 0) {
         $r.Reasons += ("{0} vs {1}: 共比對 {2} 個儲存格, StepCode 平均差異皆在門檻內。" -f $TestName, $BaseName, $r.ComparedCells)
     }
+    if ($excludedCols.Count -gt 0) {
+        # 留痕: 排除了哪些參數 (依設定 LogCompareExcludeParams)
+        $r.Reasons += ("(依設定排除 {0} 個參數不列入比對: {1})" -f $excludedCols.Count, ($excludedCols -join ";"))
+    }
     return $r
 }
 
@@ -1987,20 +2029,21 @@ function Invoke-PreRunLogDiagnosis {
     $minSec  = [int](Get-Threshold -Name "LogCompareMinSec" -DefaultValue 5)
     $topN    = [int](Get-Threshold -Name "LogCompareTopN"   -DefaultValue 10)
     $minBase = Get-Threshold -Name "LogCompareMinBaseAbs" -DefaultValue 0.0
+    $excPats = @(Get-LogCompareExcludePatterns)
 
     $cmpPrevPrev = $null
     if (-not [string]::IsNullOrEmpty($PrevPrevLogPath)) {
         $tPP = Get-StepCodeMeanTable -LogPath $PrevPrevLogPath
         $cmpPrevPrev = Compare-StepCodeMeanTables -BaseTable $tPP -TestTable $tPrev `
             -BaseName ("N-2 " + $tPP.SourceName) -TestName ("N-1 " + $tPrev.SourceName) `
-            -WarnPct $warn -HighPct $high -MinSec $minSec -TopN $topN -MinBaseAbs $minBase
+            -WarnPct $warn -HighPct $high -MinSec $minSec -TopN $topN -MinBaseAbs $minBase -ExcludeParams $excPats
     }
     $cmpGolden = $null
     if (-not [string]::IsNullOrEmpty($GoldenLogPath)) {
         $tG = Get-StepCodeMeanTable -LogPath $GoldenLogPath
         $cmpGolden = Compare-StepCodeMeanTables -BaseTable $tG -TestTable $tPrev `
             -BaseName ("Golden " + $tG.SourceName) -TestName ("N-1 " + $tPrev.SourceName) `
-            -WarnPct $gWarn -HighPct $gHigh -MinSec $minSec -TopN $topN -MinBaseAbs $minBase
+            -WarnPct $gWarn -HighPct $gHigh -MinSec $minSec -TopN $topN -MinBaseAbs $minBase -ExcludeParams $excPats
     }
 
     $levels = @(0)
@@ -2630,6 +2673,7 @@ function Invoke-RunDiagnosis {
 
     # v1.0.7: Log 檔名目錄模式 — 自動以本 Run Log vs 前一 Run Log 做
     # StepCode 平均差異比對, 結果併入機台穩定度 (機台行為面提前預警)
+    $logCmpResult = $null
     if ($null -ne $logEntry) {
         if ($null -ne $prevLogEntry) {
             try {
@@ -2642,7 +2686,9 @@ function Invoke-RunDiagnosis {
                 $lb = Get-Threshold -Name "LogCompareMinBaseAbs" -DefaultValue 0.0
                 $logCmp = Compare-StepCodeMeanTables -BaseTable $tPrev -TestTable $tSel `
                     -BaseName ("前一 Run " + [string]$prevLogEntry.RunId) -TestName ("Run " + $RunAlias) `
-                    -WarnPct $lw -HighPct $lh -MinSec $lm -TopN $lt -MinBaseAbs $lb
+                    -WarnPct $lw -HighPct $lh -MinSec $lm -TopN $lt -MinBaseAbs $lb `
+                    -ExcludeParams (@(Get-LogCompareExcludePatterns))
+                $logCmpResult = $logCmp
                 foreach ($x in $logCmp.Reasons) { $stab.Reasons += ("(Log 比對) " + $x) }
                 if ($logCmp.Level -gt $stab.Level) { $stab.Level = $logCmp.Level }
             } catch {
@@ -2714,6 +2760,7 @@ function Invoke-RunDiagnosis {
         Checks        = $checks
         MissingData   = $missing.Items
         SimilarCases  = $similar
+        LogCompare    = $logCmpResult
         DataSources   = $(if ($null -ne $logEntry) {
                             @("RunLog 檔名目錄 (" + [string]$logEntry.FileName + ")", "RunSummary", "ToolStability", "Maintenance", "ProductDrift", "HistoryCases")
                           } else {
@@ -2759,6 +2806,21 @@ function New-DiagnosisReportText {
     [void]$sb.AppendLine("原因:")
     $i = 1
     foreach ($x in $D.Stability.Reasons) { [void]$sb.AppendLine(("{0}. {1}" -f $i, $x)); $i++ }
+    # v1.0.13: Log 比對差異排行 (主報告原僅有「詳見差異排行」而無排行內容)
+    $logCmpRpt = $null
+    if ($D.ContainsKey("LogCompare")) { $logCmpRpt = $D.LogCompare }
+    if ($null -ne $logCmpRpt -and @($logCmpRpt.TopDeltas).Count -gt 0) {
+        $invLc = [System.Globalization.CultureInfo]::InvariantCulture
+        [void]$sb.AppendLine("Log 比對差異排行 (|差異%| 由大到小):")
+        foreach ($dd in $logCmpRpt.TopDeltas) {
+            [void]$sb.AppendLine(("  Step {0} | {1} | 前一 Run {2} | 本 Run {3} | 差異 {4}% | 等級 {5}" -f `
+                $dd.StepKey, $dd.Param, $dd.BaseMean.ToString("0.####", $invLc), $dd.TestMean.ToString("0.####", $invLc), `
+                $dd.DeltaPct.ToString("+0.##;-0.##", $invLc), (Get-RiskName $dd.Level)))
+        }
+        if (@($logCmpRpt.SkippedSteps).Count -gt 0) {
+            [void]$sb.AppendLine(("  略過短 Step (秒數 < 門檻): " + (@($logCmpRpt.SkippedSteps) -join ";")))
+        }
+    }
     [void]$sb.AppendLine("")
 
     [void]$sb.AppendLine("三、維修風險")
@@ -3415,6 +3477,37 @@ function Invoke-SelfTest {
     & $assert ($tItems.Count -ge 2 -and [string]$lastIt.RunId -eq "261173" -and `
                $null -ne $lastIt.Rs -and [math]::Abs([double]$lastIt.Rs - 6.7) -lt 0.01) "趨勢圖: Rs 數列由量測總檔合併 (舊->新排序)"
 
+    # --- 23. 現場回饋 3 項 (v1.0.13) ---
+    # (a) 參數排除: Dop1.* 不列入比對且留痕
+    & $assert (@(Get-LogCompareExcludePatterns) -contains "Dop1.*") "排除參數: 預設含 Dop1.*"
+    $excBase = @{ Order = @("1"); Groups = @{ "1" = @{ Key = "1"; Stepcode = "11"; N = 10; Mean = @{ "Dop1.dp_SP" = 0.01; Temp = 100.0 } } }
+                  NumCols = @("Dop1.dp_SP", "Temp"); RowCount = 10; SourceName = "b" }
+    $excTest = @{ Order = @("1"); Groups = @{ "1" = @{ Key = "1"; Stepcode = "11"; N = 10; Mean = @{ "Dop1.dp_SP" = -1.5; Temp = 110.0 } } }
+                  NumCols = @("Dop1.dp_SP", "Temp"); RowCount = 10; SourceName = "t" }
+    $cmpExc = Compare-StepCodeMeanTables -BaseTable $excBase -TestTable $excTest -BaseName "b" -TestName "t" `
+        -WarnPct 3.0 -HighPct 8.0 -MinSec 5 -TopN 5 -ExcludeParams @("Dop1.*")
+    $excText = ($cmpExc.Reasons -join " | ")
+    & $assert ($cmpExc.ComparedCells -eq 1 -and $cmpExc.ExceedCount -eq 1 -and `
+               $excText.Contains("依設定排除 1 個參數")) "排除參數: Dop1 不列入且報告留痕"
+
+    # (b) 主診斷報告含 Log 比對差異排行
+    $dRank = Invoke-RunDiagnosis -RunAlias "261175"
+    & $assert ($dRank.ContainsKey("LogCompare") -and $null -ne $dRank.LogCompare) "報告排行: 診斷結果含 Log 比對明細"
+    $rankReport = New-DiagnosisReportText -D $dRank
+    & $assert ($rankReport.Contains("Log 比對差異排行") -and $rankReport.Contains("| Temp |")) "報告排行: 主報告含差異排行內容"
+
+    # (c) 趨勢圖聯集: 量測總檔新 Run 未入 MeasurementTrend 表時圖仍涵蓋
+    $measLines2 = @(
+        "STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,FAIL_NO,LEHI_RS",
+        "PRO-001,Tool06,261176,A,Pass,,6.55",
+        "PRO-001,Tool06,261176,B,Pass,,6.57"
+    )
+    Write-AllTextUtf8 -Path (Join-Path $script:ImportRoot "Measurement_new.csv") -Text ($measLines2 -join [Environment]::NewLine)
+    $trend2 = Get-TrendChartData -ToolAlias "MAT06"
+    $t2Items = @($trend2.Items)
+    $t2Last = $t2Items[$t2Items.Count - 1]
+    & $assert ([string]$t2Last.RunId -eq "261176" -and $null -ne $t2Last.Rs) "趨勢圖: 表未更新時仍聯集量測總檔新 Run"
+
     # --- 收尾 ---
     Write-Host ""
     Write-Host ("SelfTest 結果: PASS={0} FAIL={1}" -f $t.Pass, $t.Fail)
@@ -3575,19 +3668,33 @@ function Get-TrendChartData {
         [void]$items.Add(@{ RunId = $rid; RunDate = (Get-FieldString -Object $r -PropertyName "RunDate")
                             Alarm = $alarm; Pl = $pl; Thk = $thk; Rs = $rs })
     }
-    if ($items.Count -eq 0 -and $catRuns.Count -gt 0) {
-        foreach ($m in $catRuns) {
-            $rs = $null
-            if ($rsByRun.ContainsKey([string]$m.RunId)) { $rs = [double]$rsByRun[[string]$m.RunId] }
-            [void]$items.Add(@{ RunId = [string]$m.RunId; RunDate = [string]$m.GDate
-                                Alarm = $null; Pl = $null; Thk = $null; Rs = $rs })
-        }
+    # v1.0.13: 與量測總檔目錄「聯集」— MeasurementTrend 表未更新
+    # (如檔案被 Excel 開啟鎖住致補列失敗) 時, 圖仍即時涵蓋全部量測 Run
+    $haveIds = @{}
+    foreach ($it in $items) { $haveIds[[string]$it.RunId] = $true }
+    foreach ($m in $catRuns) {
+        if ($haveIds.ContainsKey([string]$m.RunId)) { continue }
+        $rs = $null
+        if ($rsByRun.ContainsKey([string]$m.RunId)) { $rs = [double]$rsByRun[[string]$m.RunId] }
+        [void]$items.Add(@{ RunId = [string]$m.RunId; RunDate = [string]$m.GDate
+                            Alarm = $null; Pl = $null; Thk = $null; Rs = $rs })
+        $haveIds[[string]$m.RunId] = $true
     }
 
-    # 舊 -> 新: RunDate 為主, Run 碼數字為輔 (同日期 / 空日期時不亂序)
-    $sorted = @($items | Sort-Object -Property `
-        @{ Expression = { [string]$_.RunDate } }, `
-        @{ Expression = { $v = 0L; [void][long]::TryParse([string]$_.RunId, [ref]$v); $v } })
+    # 舊 -> 新排序: Run 碼皆為數字時以數字為主 (不受日期格式差異影響);
+    # 否則以 RunDate 為主、Run 碼為輔
+    $allNumeric = ($items.Count -gt 0)
+    foreach ($it in $items) {
+        $v = 0L
+        if (-not [long]::TryParse([string]$it.RunId, [ref]$v)) { $allNumeric = $false; break }
+    }
+    if ($allNumeric) {
+        $sorted = @($items | Sort-Object -Property @{ Expression = { [long]$_.RunId } })
+    } else {
+        $sorted = @($items | Sort-Object -Property `
+            @{ Expression = { [string]$_.RunDate } }, `
+            @{ Expression = { $v = 0L; [void][long]::TryParse([string]$_.RunId, [ref]$v); $v } })
+    }
     if ($sorted.Count -gt $maxN) { $sorted = @($sorted[($sorted.Count - $maxN)..($sorted.Count - 1)]) }
 
     $usePl = $false
@@ -4193,9 +4300,15 @@ function Show-ConfigEditorDialog {
     $lblNote.ForeColor = [System.Drawing.Color]::DimGray
     $form.Controls.Add($lblNote)
 
-    $form.Controls.Add((New-UiLabel -Text "規則門檻 (數值; 對應 SOP 8.2 / 10.x 規則, 建議由治理小組會議決議後修改):" -X 15 -Y 106 -Width 640))
+    # v1.0.13: Log 比對排除參數 (不是所有 Device 參數都需比對)
+    $form.Controls.Add((New-UiLabel -Text "Log 比對排除參數 (萬用字元, 分號分隔; 如 Dop1.*;Hyd1.*;*.dp_SP):" -X 15 -Y 104 -Width 400))
+    $txtExc = New-UiTextBox -X 420 -Y 102 -Width 230
+    $txtExc.Text = [string](Get-ObjectPropertyValueSafe -Object $cfg -PropertyName "LogCompareExcludeParams" -DefaultValue "")
+    $form.Controls.Add($txtExc)
+
+    $form.Controls.Add((New-UiLabel -Text "規則門檻 (數值; 對應 SOP 8.2 / 10.x 規則, 建議由治理小組會議決議後修改):" -X 15 -Y 132 -Width 640))
     $gridT = New-Object System.Windows.Forms.DataGridView
-    $gridT.Left = 15; $gridT.Top = 132; $gridT.Width = 635; $gridT.Height = 420
+    $gridT.Left = 15; $gridT.Top = 158; $gridT.Width = 635; $gridT.Height = 394
     $gridT.AllowUserToAddRows = $false
     $gridT.AllowUserToDeleteRows = $false
     $gridT.RowHeadersVisible = $false
@@ -4248,6 +4361,7 @@ function Show-ConfigEditorDialog {
             }
             $cfg["Thresholds"] = $newTh
             $cfg["DataSource"] = $mode
+            $cfg["LogCompareExcludeParams"] = $txtExc.Text.Trim()
             $sqlCfg["Enabled"] = [bool]$chkSql.Checked
             $sqlCfg["ConnectionString"] = $connStr
             Save-AppConfig
@@ -4631,7 +4745,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.12
+# EOF RunPreCheckAI.ps1 v1.0.13
 
 
 
