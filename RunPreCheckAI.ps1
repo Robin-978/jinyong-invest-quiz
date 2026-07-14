@@ -25,6 +25,19 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.17 新增 (依現場回饋):
+          (1) MeasurementTrend 加 RsDeltaPct 欄 — 既有表自動遷移加欄
+              (既有列補空值, 寫檔前備份), 自動補列時計算 Rs 對前一量測
+              Run 的偏差% (量測總檔);
+          (2) ProductDrift 自動帶入 — 由量測總檔逐 Run 補列 RsDeltaPct /
+              PLPeakShiftNm / ConsecutivePLShiftRuns / UniformityTrend /
+              AOIDefectTrend (與診斷即時計算同一套規則, 抽出
+              Get-MeasurementPairDrift 共用); 首個量測 Run 無前 Run
+              可比不補列; 只增列不覆蓋人工列;
+          (3) 診斷之量測摘要與 PF Fail 高風險判定改為「只要有量測資料
+              就執行」— ProductDrift 建表後不再失效;
+          (4) 補列改依檔案實際標頭逐欄對應 (保留使用者自訂欄位);
+          SelfTest 增至 135 項。
    1.0.16 修正: 資料表管理欄位全擠在一欄 — 標頭解析誤將 Split-CsvLineFields
           的逗號包裝回傳再以 @() 包一層, 欄名陣列變成單一巢狀元素
           (顯示為空白連接的一整串)。抽出 Read-CsvHeaderColumns (逐元素
@@ -205,7 +218,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.16"
+$script:AIVersion = "1.0.17"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -1020,10 +1033,44 @@ $script:ImportTableHeaders = @{
     "ToolStability.csv"    = "RunID_Alias,ToolAlias,TempStabilityScore,PressureStabilityScore,MFCStabilityScore,RotationStabilityScore,VacuumRecoveryTimeMin,AlarmCountLastRun,CriticalAlarmCount,InterlockEventCount,CriticalAlarmWithin24h,RecentAlarmCodes"
     "Maintenance.csv"      = "RunID_Alias,ToolAlias,DaysAfterPM,RunsAfterPM,DaysAfterPartChange,RecentSameAlarmCount7d,MTBFTrend,RecentCorrectiveMaintenance,GoldenRunVerified"
     "ProductDrift.csv"     = "RunID_Alias,ToolAlias,ProductFamily,PLPeakShiftNm,ConsecutivePLShiftRuns,PLIntensityTrend,XRDPeakShiftDeg,ThicknessDeltaPct,UniformityTrend,RsDeltaPct,AOIDefectTrend,OverSpcWarning,OverSpcControl"
-    "MeasurementTrend.csv" = "RunID_Alias,ToolAlias,RunDate,AlarmCount,PLPeakShiftNm,ThicknessDeltaPct"
+    "MeasurementTrend.csv" = "RunID_Alias,ToolAlias,RunDate,AlarmCount,PLPeakShiftNm,ThicknessDeltaPct,RsDeltaPct"
     "HistoryCases.csv"     = "CaseID,ToolAlias,ProductFamily,RiskCategory,Keywords,Summary,Action,Outcome,CaseDate"
 }
 function Get-ImportTableHeaders { return $script:ImportTableHeaders }
+
+function Add-TableColumnIfMissing {
+    <#
+      資料表結構遷移 (v1.0.17): 檔案標頭缺指定欄時自動加欄 —
+      重寫檔案 (標頭加欄, 既有列補空值), 寫檔前自動備份。
+      回傳 $true = 已加欄。
+    #>
+    param([string]$Path, [string]$Column)
+    $hdr = @(Read-CsvHeaderColumns -Path $Path)
+    if ($hdr.Count -eq 0 -or $hdr -contains $Column) { return $false }
+    $rows = @(Import-CsvSafe -Path $Path)
+    $newHdr = @($hdr) + $Column
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add((Join-CsvLine $newHdr))
+    foreach ($r in $rows) {
+        $vals = @()
+        foreach ($c in $newHdr) { $vals += (Get-FieldString -Object $r -PropertyName ([string]$c)) }
+        $lines.Add((Join-CsvLine $vals))
+    }
+    Write-FileSafe -Path $Path -Text (($lines.ToArray()) -join [Environment]::NewLine)
+    Write-AppLog ("資料表 {0} 已自動加欄: {1} (既有列補空值)。" -f (Split-Path -Leaf $Path), $Column)
+    return $true
+}
+
+function New-CsvLineForHeader {
+    # 依標頭欄序由值對應表組 CSV 行 (無對應鍵補空值; 保留使用者自訂欄位)
+    param([object[]]$Header, [hashtable]$Values)
+    $vals = @()
+    foreach ($c in $Header) {
+        $k = [string]$c
+        if ($Values.ContainsKey($k)) { $vals += [string]$Values[$k] } else { $vals += "" }
+    }
+    return (Join-CsvLine $vals)
+}
 
 function Read-CsvHeaderColumns {
     <#
@@ -1064,9 +1111,9 @@ function Initialize-ImportTableTemplates {
             "機台秒級 Log 檔與量測總檔直接放入 Import / RawImport 即可, 不必建表。",
             "",
             "[自動 vs 手動]",
-            "  自動補列: RunSummary (由 Log 檔名) 與 MeasurementTrend (由量測總檔)",
-            "            於啟動與「重載資料」時自動增列缺少的 Run; 人工維護列不會被覆蓋。",
-            "  自動彙總: ProductDrift 可不填 — 量測總檔存在時系統自動計算飄移。",
+            "  自動補列: RunSummary (由 Log 檔名)、MeasurementTrend 與 ProductDrift",
+            "            (由量測總檔) 於啟動與「重載資料」時自動增列缺少的 Run;",
+            "            人工維護列不會被覆蓋。",
             "  需手動 / MES 匯出: ToolStability (alarm 與穩定度分數)、Maintenance (PM / 換件)、",
             "            HistoryCases (歷史案例) — 這些資料不在 Log 或量測檔內, 系統無從產生;",
             "            未填時該面向以「保守中風險 + 資料不足」呈現。",
@@ -1087,14 +1134,14 @@ function Initialize-ImportTableTemplates {
             "  RecentSameAlarmCount7d=同一 Alarm 7 天內次數  MTBFTrend=Up|Flat|Down",
             "  RecentCorrectiveMaintenance=Yes|No  GoldenRunVerified=Yes|No|NA",
             "",
-            "[ProductDrift.csv] 產品特性飄移 (量測總檔存在時可不填, 系統自動彙總)",
+            "[ProductDrift.csv] 產品特性飄移 (量測總檔存在時自動補列, 可人工補充)",
             "  PLPeakShiftNm=PL 峰值偏移 nm  ConsecutivePLShiftRuns=連續同方向偏移 Run 數",
             "  PLIntensityTrend=Up|Flat|Down  XRDPeakShiftDeg=XRD 偏移度  ThicknessDeltaPct=厚度偏差%",
             "  UniformityTrend=Better|Flat|Worse  RsDeltaPct=Rs 偏差%  AOIDefectTrend=Up|Flat|Down",
             "  OverSpcWarning/OverSpcControl=0|1 (超出 SPC warning/control limit)",
             "",
             "[MeasurementTrend.csv] 趨勢圖資料 (診斷頁右側圖表)",
-            "  RunDate=yyyy-MM-dd  AlarmCount=Alarm 數  PLPeakShiftNm / ThicknessDeltaPct 同上",
+            "  RunDate=yyyy-MM-dd  AlarmCount=Alarm 數  PLPeakShiftNm / ThicknessDeltaPct / RsDeltaPct 同上",
             "",
             "[HistoryCases.csv] 歷史案例 (相似案例推薦來源)",
             "  CaseID=案例代號  RiskCategory=Stability|Maintenance|Drift  Keywords=關鍵字(分號分隔)",
@@ -1261,6 +1308,45 @@ function Get-MeasurementRunCatalog {
     return $list
 }
 
+function Get-MeasurementPairDrift {
+    <#
+      兩個量測 Run 彙總的飄移欄位值 (v1.0.17; 診斷即時計算與
+      ProductDrift/MeasurementTrend 自動補列共用同一套規則):
+      RsDeltaPct / PLPeakShiftNm / UniformityTrend(Worse) / AOIDefectTrend(Up)
+      值為字串 (供寫表; 餵 Get-DriftRisk 亦可); 無法計算的鍵不出現。
+    #>
+    param([hashtable]$Cur, [hashtable]$Prev)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $unifWorsen = Get-Threshold -Name "MeasUnifWorsenPct" -DefaultValue 20.0
+    $defUp      = Get-Threshold -Name "MeasDefectUpPct"   -DefaultValue 30.0
+    $r = @{}
+
+    $rc = $Cur.Mean["LEHI_RS"]; $rp = $Prev.Mean["LEHI_RS"]
+    if ($null -ne $rc -and $null -ne $rp -and [math]::Abs([double]$rp) -gt 1e-9) {
+        $r["RsDeltaPct"] = ([math]::Round((([double]$rc - [double]$rp) / [math]::Abs([double]$rp)) * 100.0, 2)).ToString($inv)
+    }
+    $uc = $Cur.Mean["LEHI_UNIF_STD"]; $up = $Prev.Mean["LEHI_UNIF_STD"]
+    if ($null -ne $uc -and $null -ne $up -and [double]$up -gt 1e-9) {
+        if (((([double]$uc - [double]$up) / [double]$up) * 100.0) -gt $unifWorsen) { $r["UniformityTrend"] = "Worse" }
+    }
+    $defCol = ""
+    foreach ($c in @("LPD3+4", "Area_total")) {
+        if ($null -ne $Cur.Mean[$c] -and $null -ne $Prev.Mean[$c]) { $defCol = $c; break }
+    }
+    if (-not [string]::IsNullOrEmpty($defCol)) {
+        $dc = [double]$Cur.Mean[$defCol]; $dp = [double]$Prev.Mean[$defCol]
+        if ($dp -gt 1e-9 -and ((($dc - $dp) / $dp) * 100.0) -gt $defUp) { $r["AOIDefectTrend"] = "Up" }
+    }
+    $plCol = ""
+    foreach ($c in @("IGA_WL_AVG", "AGA_WL_AVG")) {
+        if ($null -ne $Cur.Mean[$c] -and $null -ne $Prev.Mean[$c]) { $plCol = $c; break }
+    }
+    if (-not [string]::IsNullOrEmpty($plCol)) {
+        $r["PLPeakShiftNm"] = ([math]::Round(([double]$Cur.Mean[$plCol] - [double]$Prev.Mean[$plCol]), 3)).ToString($inv)
+    }
+    return $r
+}
+
 function Get-MeasurementDriftInfo {
     <#
       依機台 (MAT06 / Tool06 皆取尾碼數字對應) 找 RunId <= UpToRunId 的
@@ -1286,36 +1372,21 @@ function Get-MeasurementDriftInfo {
     $prev = $null
     if ($mine.Count -ge 2) { $prev = $mine[1] }
 
-    $unifWorsen = Get-Threshold -Name "MeasUnifWorsenPct" -DefaultValue 20.0
-    $defUp      = Get-Threshold -Name "MeasDefectUpPct"   -DefaultValue 30.0
-    $plMin      = Get-Threshold -Name "PLShiftMinNm"      -DefaultValue 0.5
+    $plMin = Get-Threshold -Name "PLShiftMinNm" -DefaultValue 0.5
 
     $row = @{ RunID_Alias = [string]$cur.RunId }
     if ($null -ne $prev) {
-        $rc = $cur.Mean["LEHI_RS"]; $rp = $prev.Mean["LEHI_RS"]
-        if ($null -ne $rc -and $null -ne $rp -and [math]::Abs([double]$rp) -gt 1e-9) {
-            $row["RsDeltaPct"] = [math]::Round((([double]$rc - [double]$rp) / [math]::Abs([double]$rp)) * 100.0, 2)
-        }
-        $uc = $cur.Mean["LEHI_UNIF_STD"]; $up = $prev.Mean["LEHI_UNIF_STD"]
-        if ($null -ne $uc -and $null -ne $up -and [double]$up -gt 1e-9) {
-            if (((([double]$uc - [double]$up) / [double]$up) * 100.0) -gt $unifWorsen) { $row["UniformityTrend"] = "Worse" }
-        }
-        $defCol = ""
-        foreach ($c in @("LPD3+4", "Area_total")) {
-            if ($null -ne $cur.Mean[$c] -and $null -ne $prev.Mean[$c]) { $defCol = $c; break }
-        }
-        if (-not [string]::IsNullOrEmpty($defCol)) {
-            $dc = [double]$cur.Mean[$defCol]; $dp = [double]$prev.Mean[$defCol]
-            if ($dp -gt 1e-9 -and ((($dc - $dp) / $dp) * 100.0) -gt $defUp) { $row["AOIDefectTrend"] = "Up" }
-        }
-        # PL 波長偏移與連續同方向偏移 Run 數 (非所有產品皆量測 PL)
+        # v1.0.17: 與 ProductDrift/MeasurementTrend 自動補列共用同一套 pair 規則
+        $pd = Get-MeasurementPairDrift -Cur $cur -Prev $prev
+        foreach ($k in $pd.Keys) { $row[$k] = $pd[$k] }
+
+        # PL 連續同方向偏移 Run 數 (需整段量測序列, 於此計算)
         $plCol = ""
         foreach ($c in @("IGA_WL_AVG", "AGA_WL_AVG")) {
             if ($null -ne $cur.Mean[$c] -and $null -ne $prev.Mean[$c]) { $plCol = $c; break }
         }
         if (-not [string]::IsNullOrEmpty($plCol)) {
             $shift = [double]$cur.Mean[$plCol] - [double]$prev.Mean[$plCol]
-            $row["PLPeakShiftNm"] = [math]::Round($shift, 3)
             $consec = 0
             if ([math]::Abs($shift) -ge $plMin) {
                 $sign = [math]::Sign($shift)
@@ -1400,39 +1471,101 @@ function Update-DerivedTables {
         Write-AppLog ("RunSummary 自動補列 {0} 筆 (由 Log 檔名目錄)。" -f $rsAdded)
     }
 
-    # --- MeasurementTrend: 由量測總檔補列 (PL 偏移 = 對前一量測 Run) ---
+    # --- 量測總檔: 逐 Run pair 飄移值 (MeasurementTrend / ProductDrift 共用) ---
+    $meas = @(Get-MeasurementRunCatalog)
+    $meas = @($meas | Sort-Object -Property @{ Expression = { [int]$_.ToolNum } }, @{ Expression = { [long]$_.RunId } })
+    $plMin = Get-Threshold -Name "PLShiftMinNm" -DefaultValue 0.5
+    $pairByRun = @{}
+    $prevByTool = @{}
+    $consecByTool = @{}
+    foreach ($m in $meas) {
+        $toolAlias = "MAT{0:D2}" -f [int]$m.ToolNum
+        $vals = @{}
+        if ($prevByTool.ContainsKey($toolAlias)) {
+            $vals = Get-MeasurementPairDrift -Cur $m -Prev $prevByTool[$toolAlias]
+            if ($vals.ContainsKey("PLPeakShiftNm")) {
+                # PL 連續同方向偏移 Run 數 (依時間序遞增計算)
+                $shift = [double]$vals["PLPeakShiftNm"]
+                if ([math]::Abs($shift) -ge $plMin) {
+                    $sign = [math]::Sign($shift)
+                    $c = 1
+                    if ($consecByTool.ContainsKey($toolAlias) -and [int]$consecByTool[$toolAlias].Sign -eq $sign) {
+                        $c = [int]$consecByTool[$toolAlias].Count + 1
+                    }
+                    $consecByTool[$toolAlias] = @{ Sign = $sign; Count = $c }
+                    $vals["ConsecutivePLShiftRuns"] = [string]$c
+                } else {
+                    if ($consecByTool.ContainsKey($toolAlias)) { $consecByTool.Remove($toolAlias) }
+                    $vals["ConsecutivePLShiftRuns"] = "0"
+                }
+            }
+        }
+        $pairByRun[($toolAlias + "|" + [string]$m.RunId)] = $vals
+        $prevByTool[$toolAlias] = $m
+    }
+
+    # --- MeasurementTrend: 自動補列 (v1.0.17: 加 RsDeltaPct 欄, 既有表自動遷移加欄) ---
     $mtPath = Join-Path $script:ImportRoot "MeasurementTrend.csv"
+    [void](Add-TableColumnIfMissing -Path $mtPath -Column "RsDeltaPct")
+    $mtHdr = @(Read-CsvHeaderColumns -Path $mtPath)
     $mtExisting = @{}
     foreach ($r in @(Import-CsvSafe -Path $mtPath)) {
         $k = Get-FieldString -Object $r -PropertyName "RunID_Alias"
         if (-not [string]::IsNullOrEmpty($k)) { $mtExisting[$k] = $true }
     }
-    $meas = @(Get-MeasurementRunCatalog)
-    $meas = @($meas | Sort-Object -Property @{ Expression = { [int]$_.ToolNum } }, @{ Expression = { [long]$_.RunId } })
     $mtLines = New-Object System.Collections.Generic.List[string]
-    $prevPlByTool = @{}
     $mtAdded = 0
-    foreach ($m in $meas) {
-        $toolAlias = "MAT{0:D2}" -f [int]$m.ToolNum
-        $pl = $m.Mean["IGA_WL_AVG"]
-        if ($null -eq $pl) { $pl = $m.Mean["AGA_WL_AVG"] }
-        $shiftTxt = ""
-        if ($prevPlByTool.ContainsKey($toolAlias) -and $null -ne $pl -and $null -ne $prevPlByTool[$toolAlias]) {
-            $shiftTxt = ([double]$pl - [double]$prevPlByTool[$toolAlias]).ToString("0.###", $inv)
+    if ($mtHdr.Count -gt 0) {
+        foreach ($m in $meas) {
+            if ($mtExisting.ContainsKey([string]$m.RunId)) { continue }
+            $toolAlias = "MAT{0:D2}" -f [int]$m.ToolNum
+            $vals = $pairByRun[($toolAlias + "|" + [string]$m.RunId)]
+            $map = @{ RunID_Alias = [string]$m.RunId; ToolAlias = $toolAlias; RunDate = [string]$m.GDate }
+            foreach ($k in @("PLPeakShiftNm", "RsDeltaPct")) {
+                if ($vals.ContainsKey($k)) { $map[$k] = [string]$vals[$k] }
+            }
+            $mtLines.Add((New-CsvLineForHeader -Header $mtHdr -Values $map))
+            $mtExisting[[string]$m.RunId] = $true
+            $mtAdded++
         }
-        $prevPlByTool[$toolAlias] = $pl
-        if ($mtExisting.ContainsKey([string]$m.RunId)) { continue }
-        # 欄序: RunID_Alias,ToolAlias,RunDate,AlarmCount,PLPeakShiftNm,ThicknessDeltaPct
-        $mtLines.Add((Join-CsvLine @([string]$m.RunId, $toolAlias, [string]$m.GDate, "", $shiftTxt, "")))
-        $mtExisting[[string]$m.RunId] = $true
-        $mtAdded++
     }
     if ($mtLines.Count -gt 0) {
         Add-LinesSafe -Path $mtPath -Lines $mtLines
         Write-AppLog ("MeasurementTrend 自動補列 {0} 筆 (由量測總檔)。" -f $mtAdded)
     }
 
-    return @{ RunSummaryAdded = $rsAdded; MeasurementTrendAdded = $mtAdded }
+    # --- ProductDrift: 自動帶入 (v1.0.17; 與診斷即時計算同一套 pair 規則) ---
+    # 首個量測 Run 無前 Run 可比, 不補列 (避免看似「無漂移」的空判定列)
+    $pdPath = Join-Path $script:ImportRoot "ProductDrift.csv"
+    $pdHdr = @(Read-CsvHeaderColumns -Path $pdPath)
+    $pdExisting = @{}
+    foreach ($r in @(Import-CsvSafe -Path $pdPath)) {
+        $k = Get-FieldString -Object $r -PropertyName "RunID_Alias"
+        if (-not [string]::IsNullOrEmpty($k)) { $pdExisting[$k] = $true }
+    }
+    $pdLines = New-Object System.Collections.Generic.List[string]
+    $pdAdded = 0
+    if ($pdHdr.Count -gt 0) {
+        foreach ($m in $meas) {
+            if ($pdExisting.ContainsKey([string]$m.RunId)) { continue }
+            $toolAlias = "MAT{0:D2}" -f [int]$m.ToolNum
+            $vals = $pairByRun[($toolAlias + "|" + [string]$m.RunId)]
+            if ($null -eq $vals -or $vals.Count -eq 0) { continue }
+            $map = @{ RunID_Alias = [string]$m.RunId; ToolAlias = $toolAlias; ProductFamily = [string]$m.Structure }
+            foreach ($k in @("RsDeltaPct", "PLPeakShiftNm", "ConsecutivePLShiftRuns", "UniformityTrend", "AOIDefectTrend")) {
+                if ($vals.ContainsKey($k)) { $map[$k] = [string]$vals[$k] }
+            }
+            $pdLines.Add((New-CsvLineForHeader -Header $pdHdr -Values $map))
+            $pdExisting[[string]$m.RunId] = $true
+            $pdAdded++
+        }
+    }
+    if ($pdLines.Count -gt 0) {
+        Add-LinesSafe -Path $pdPath -Lines $pdLines
+        Write-AppLog ("ProductDrift 自動補列 {0} 筆 (由量測總檔)。" -f $pdAdded)
+    }
+
+    return @{ RunSummaryAdded = $rsAdded; MeasurementTrendAdded = $mtAdded; ProductDriftAdded = $pdAdded }
 }
 
 # ============================================================
@@ -2677,13 +2810,14 @@ function Invoke-RunDiagnosis {
         if ($null -ne $driftRow) { $driftSourceAlias = $RunAlias }
     }
 
-    # v1.0.8: Log 檔名目錄模式 — ProductDrift 查無資料時, 改以量測總檔
-    # (STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,...) 為產品特性飄移來源;
-    # 取 RunId <= 本 Run 的最近量測 Run (符合量測資料時效, 通常為 N-2)
+    # v1.0.8/1.0.17: 量測總檔 (STRUCTURE,REACTOR,RUN_NO,POS_NO,PF,...) —
+    # 只要有量測資料就取得摘要與 PF 判定 (ProductDrift 建表後仍生效);
+    # ProductDrift 查無資料時以其為飄移來源
+    # (取 RunId <= 本 Run 的最近量測 Run, 符合量測資料時效, 通常為 N-2)
     $measInfo = $null
-    if ($null -ne $logEntry -and $null -eq $driftRow) {
+    if ($null -ne $logEntry) {
         $measInfo = Get-MeasurementDriftInfo -ToolAlias $toolAlias -UpToRunId ([long]$RunAlias)
-        if ($null -ne $measInfo) {
+        if ($null -ne $measInfo -and $null -eq $driftRow) {
             $driftRow = $measInfo.DriftRow
             $driftSourceAlias = [string]$measInfo.Current.RunId
         }
@@ -3583,6 +3717,28 @@ function Invoke-SelfTest {
     $mHdrCols = @(Read-CsvHeaderColumns -Path (Join-Path $script:ImportRoot "Maintenance.csv"))
     & $assert ($mHdrCols.Count -eq 9 -and $mHdrCols[1] -eq "ToolAlias") "標頭解析: 欄數與欄名正確 (9 欄)"
     & $assert ($mHdrCols[0] -is [string] -and $mHdrCols[0] -eq "RunID_Alias") "標頭解析: 各元素為單一欄名字串 (非巢狀陣列)"
+
+    # --- 27. MeasurementTrend 加 RsDeltaPct / ProductDrift 自動帶入 (v1.0.17) ---
+    # 模擬舊版表 (無 RsDeltaPct 欄, 含既有列) -> 自動遷移加欄並補列
+    $mtPathT = Join-Path $script:ImportRoot "MeasurementTrend.csv"
+    Write-AllTextUtf8 -Path $mtPathT -Text (@(
+        "RunID_Alias,ToolAlias,RunDate,AlarmCount,PLPeakShiftNm,ThicknessDeltaPct",
+        "261172,MAT06,,,,"
+    ) -join [Environment]::NewLine)
+    $upd3 = Update-DerivedTables
+    $mtHdr2 = @(Read-CsvHeaderColumns -Path $mtPathT)
+    $mtText2 = Read-AllTextUtf8 -Path $mtPathT
+    & $assert ($mtHdr2 -contains "RsDeltaPct" -and $mtText2.Contains("261172,MAT06")) "量測趨勢: 既有表自動遷移加 RsDeltaPct 欄 (既有列保留)"
+    & $assert ($mtText2.Contains("261176,MAT06") -and $mtText2.Contains("-2.09")) "量測趨勢: 新列含 RsDeltaPct (Rs -2.09%)"
+    $pdRows = @(Import-CsvSafe -Path (Join-Path $script:ImportRoot "ProductDrift.csv"))
+    $pd173 = $null
+    foreach ($r in $pdRows) { if ((Get-FieldString -Object $r -PropertyName "RunID_Alias") -eq "261173") { $pd173 = $r } }
+    & $assert ($null -ne $pd173 -and (Get-FieldString -Object $pd173 -PropertyName "RsDeltaPct") -eq "3.08" -and `
+               (Get-FieldString -Object $pd173 -PropertyName "AOIDefectTrend") -eq "Up") "產品飄移: 由量測總檔自動帶入 (Rs +3.08% / 缺陷 Up)"
+    # 建表後診斷: PF Fail 高風險與量測摘要不失效 (解耦回歸)
+    $dPd = Invoke-RunDiagnosis -RunAlias "261175"
+    $pdDriftText = ($dPd.Drift.Reasons -join " | ")
+    & $assert ($dPd.DriftSourceRun -eq "261173" -and $pdDriftText.Contains("量測最終判定") -and $dPd.Drift.Level -ge 3) "產品飄移: 建表後 PF Fail 高風險與來源 Run 保留"
 
     # --- 收尾 ---
     Write-Host ""
@@ -5015,7 +5171,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.16
+# EOF RunPreCheckAI.ps1 v1.0.17
 
 
 
