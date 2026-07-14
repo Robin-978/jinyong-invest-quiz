@@ -25,6 +25,16 @@
    自我測試 : powershell -NoProfile -ExecutionPolicy Bypass -File RunPreCheckAI.ps1 -SelfTest
 
  Changelog:
+   1.0.15 新增: 資料表管理介面 — 設定頁「資料表管理」按鈕 (Admin/Engineer):
+          RunSummary / ToolStability / Maintenance / ProductDrift /
+          MeasurementTrend / HistoryCases 六張 Data\Import 資料表的
+          檢視/編輯對話框:
+          (1) 表格直接編輯; 底部空白列輸入即新增; 選列 Delete 刪除;
+          (2) 儲存採原子寫檔, 寫檔前自動備份至 Backup\BeforeWrite,
+              並寫入稽核留痕 (TABLE_EDITED + RoleCode);
+          (3) 標頭以檔案現況為準 (保留自訂欄位), 檔案缺漏用範本標頭;
+              未儲存切換/關閉會提醒; 六張表標頭定義集中共用;
+          SelfTest 增至 129 項。
    1.0.14 修正 (依現場回饋): Log 分組鍵改以 StepLabel 為主 —
           StepLabel 才是真正對應到實際磊晶 Layer 的欄位 (同一 Layer 可
           橫跨多個 Step 編號; 不同 Run 的 Step 編號可能位移):
@@ -190,7 +200,7 @@ if ($script:IsGuiMode) {
 # Globals
 # ============================================================
 $script:AppName   = "Run 前 AI 製程風險診斷助手"
-$script:AIVersion = "1.0.14"
+$script:AIVersion = "1.0.15"
 
 function Set-AppRootPaths {
     # 集中設定所有路徑; SelfTest 模式會改指到暫存資料夾, 不污染正式資料
@@ -999,15 +1009,19 @@ function Get-RunLogCatalog {
 # 診斷行為完全相同 (行為中性), 目的是讓工程師知道要填哪些欄位。
 # 已存在的檔案一律不動。
 # ============================================================
+# 六張資料表標頭定義 (v1.0.15: 集中定義, 範本建立與資料表管理介面共用)
+$script:ImportTableHeaders = @{
+    "RunSummary.csv"       = "RunID_Alias,ToolAlias,ChamberAlias,ProductFamily,RecipeFamily,RecipeVersionGroup,PreviousProductFamily,RunStartTime,RunEndTime,RunResult,OperatorShift,RecipeVersionChanged,RecipeChangeNote"
+    "ToolStability.csv"    = "RunID_Alias,ToolAlias,TempStabilityScore,PressureStabilityScore,MFCStabilityScore,RotationStabilityScore,VacuumRecoveryTimeMin,AlarmCountLastRun,CriticalAlarmCount,InterlockEventCount,CriticalAlarmWithin24h,RecentAlarmCodes"
+    "Maintenance.csv"      = "RunID_Alias,ToolAlias,DaysAfterPM,RunsAfterPM,DaysAfterPartChange,RecentSameAlarmCount7d,MTBFTrend,RecentCorrectiveMaintenance,GoldenRunVerified"
+    "ProductDrift.csv"     = "RunID_Alias,ToolAlias,ProductFamily,PLPeakShiftNm,ConsecutivePLShiftRuns,PLIntensityTrend,XRDPeakShiftDeg,ThicknessDeltaPct,UniformityTrend,RsDeltaPct,AOIDefectTrend,OverSpcWarning,OverSpcControl"
+    "MeasurementTrend.csv" = "RunID_Alias,ToolAlias,RunDate,AlarmCount,PLPeakShiftNm,ThicknessDeltaPct"
+    "HistoryCases.csv"     = "CaseID,ToolAlias,ProductFamily,RiskCategory,Keywords,Summary,Action,Outcome,CaseDate"
+}
+function Get-ImportTableHeaders { return $script:ImportTableHeaders }
+
 function Initialize-ImportTableTemplates {
-    $templates = @{
-        "RunSummary.csv"       = "RunID_Alias,ToolAlias,ChamberAlias,ProductFamily,RecipeFamily,RecipeVersionGroup,PreviousProductFamily,RunStartTime,RunEndTime,RunResult,OperatorShift,RecipeVersionChanged,RecipeChangeNote"
-        "ToolStability.csv"    = "RunID_Alias,ToolAlias,TempStabilityScore,PressureStabilityScore,MFCStabilityScore,RotationStabilityScore,VacuumRecoveryTimeMin,AlarmCountLastRun,CriticalAlarmCount,InterlockEventCount,CriticalAlarmWithin24h,RecentAlarmCodes"
-        "Maintenance.csv"      = "RunID_Alias,ToolAlias,DaysAfterPM,RunsAfterPM,DaysAfterPartChange,RecentSameAlarmCount7d,MTBFTrend,RecentCorrectiveMaintenance,GoldenRunVerified"
-        "ProductDrift.csv"     = "RunID_Alias,ToolAlias,ProductFamily,PLPeakShiftNm,ConsecutivePLShiftRuns,PLIntensityTrend,XRDPeakShiftDeg,ThicknessDeltaPct,UniformityTrend,RsDeltaPct,AOIDefectTrend,OverSpcWarning,OverSpcControl"
-        "MeasurementTrend.csv" = "RunID_Alias,ToolAlias,RunDate,AlarmCount,PLPeakShiftNm,ThicknessDeltaPct"
-        "HistoryCases.csv"     = "CaseID,ToolAlias,ProductFamily,RiskCategory,Keywords,Summary,Action,Outcome,CaseDate"
-    }
+    $templates = Get-ImportTableHeaders
     $created = @()
     foreach ($name in $templates.Keys) {
         $p = Join-Path $script:ImportRoot $name
@@ -3535,6 +3549,13 @@ function Invoke-SelfTest {
     $tLblFb = Get-StepCodeMeanTableFallback -LogPath $logLabel
     & $assert ($tLblFb.GroupColumn -eq "StepLabel" -and [math]::Abs([double]$tLblFb.Groups["QW"].Mean["Temp"] - 200) -lt 1e-9) "StepLabel: 退回模式同樣依 StepLabel 分組"
 
+    # --- 25. 資料表管理 (v1.0.15): 標頭定義集中共用 ---
+    $hdrs = Get-ImportTableHeaders
+    & $assert ($hdrs.Count -eq 6 -and $hdrs.ContainsKey("RunSummary.csv") -and `
+               ([string]$hdrs["HistoryCases.csv"]).StartsWith("CaseID,")) "資料表管理: 六張表標頭定義集中"
+    $mtHdrLine = ((Read-AllTextUtf8 -Path (Join-Path $script:ImportRoot "MeasurementTrend.csv")) -split "`r?`n")[0].Trim()
+    & $assert ($mtHdrLine -eq [string]$hdrs["MeasurementTrend.csv"]) "資料表管理: 範本檔標頭與定義一致"
+
     # --- 收尾 ---
     Write-Host ""
     Write-Host ("SelfTest 結果: PASS={0} FAIL={1}" -f $t.Pass, $t.Fail)
@@ -4289,6 +4310,189 @@ function Build-HistoryTab {
 # ============================================================
 # 設定編輯對話框 (config.json; 僅 Admin 由設定頁開啟)
 # ============================================================
+function Show-TableManagerDialog {
+    <#
+      資料表管理 (v1.0.15): 六張 Data\Import 資料表的檢視 / 編輯介面。
+      - 表格直接編輯; 底部空白列輸入即新增; 點選列頭後按 Delete 刪除列
+      - 儲存: 原子寫檔 + 寫檔前自動備份 (Backup\BeforeWrite) + 稽核留痕
+      - 標頭以檔案現況為準 (保留使用者自訂欄位); 檔案不存在用範本標頭
+      - 未儲存的變更在切換資料表 / 關閉視窗時會提醒
+    #>
+    param([hashtable]$St)
+
+    $form = New-Form -Text "資料表管理 (Data\Import) — 儲存時自動備份與稽核留痕" -Width 1010 -Height 660
+    $form.MinimizeBox = $false
+
+    $form.Controls.Add((New-UiLabel -Text "資料表:" -X 10 -Y 14 -Width 60))
+    $cbTable = New-UiComboBox -X 74 -Y 12 -Width 190
+    foreach ($t in @("RunSummary", "ToolStability", "Maintenance", "ProductDrift", "MeasurementTrend", "HistoryCases")) {
+        [void]$cbTable.Items.Add($t)
+    }
+    $form.Controls.Add($cbTable)
+
+    $btnSave = New-UiButton -Text "儲存 (留痕)" -X 280 -Y 10 -Width 110
+    $btnSave.BackColor = [System.Drawing.Color]::FromArgb(39, 174, 96)
+    $btnSave.ForeColor = [System.Drawing.Color]::White
+    $form.Controls.Add($btnSave)
+    $btnReloadT = New-UiButton -Text "重新載入" -X 400 -Y 10 -Width 100
+    $form.Controls.Add($btnReloadT)
+    $btnFolder = New-UiButton -Text "開啟資料夾" -X 510 -Y 10 -Width 100
+    $form.Controls.Add($btnFolder)
+    $btnColHelp = New-UiButton -Text "欄位說明" -X 620 -Y 10 -Width 90
+    $form.Controls.Add($btnColHelp)
+
+    $lblInfo = New-UiLabel -Text "" -X 10 -Y 44 -Width 980 -Height 22
+    $lblInfo.ForeColor = [System.Drawing.Color]::DimGray
+    $form.Controls.Add($lblInfo)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Left = 10; $grid.Top = 70; $grid.Width = 974; $grid.Height = 490
+    $grid.AllowUserToAddRows = $true
+    $grid.AllowUserToDeleteRows = $true
+    $grid.RowHeadersVisible = $true
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::DisplayedCells
+    $grid.Anchor = "Top,Bottom,Left,Right"
+    $form.Controls.Add($grid)
+
+    $lblHint = New-UiLabel -Text "提示: 直接點儲存格修改; 最下方空白列輸入即新增; 點選列頭後按 Delete 刪除列。RunID_Alias 接受 Run 碼 (261176) 或 機台+Run 碼 (MAT06261176)。儲存後請於診斷頁按「重載資料」。" -X 10 -Y 570 -Width 980 -Height 40
+    $lblHint.ForeColor = [System.Drawing.Color]::DimGray
+    $lblHint.Anchor = "Bottom,Left,Right"
+    $form.Controls.Add($lblHint)
+
+    $descMap = @{
+        RunSummary       = "Run 基本資料 (可由 Log 檔名自動補列; 人工列不會被覆蓋)"
+        ToolStability    = "前一 Run 機台穩定度 (alarm / 分數; 需 MES 匯出或人工維護)"
+        Maintenance      = "維修 / PM 特徵 (需 MES 匯出或人工維護)"
+        ProductDrift     = "產品特性飄移 (量測總檔存在時可不填, 系統自動彙總)"
+        MeasurementTrend = "趨勢圖資料 (可由量測總檔自動補列)"
+        HistoryCases     = "歷史案例知識庫 (人工維護, 供相似案例推薦)"
+    }
+    $ui = @{ Table = ""; Header = @(); Dirty = $false; Loading = $false; Switching = $false }
+
+    $loadTable = {
+        try {
+            $name = [string]$cbTable.SelectedItem
+            if ([string]::IsNullOrEmpty($name)) { return }
+            $ui.Loading = $true
+            $grid.Rows.Clear()
+            $grid.Columns.Clear()
+            $path = Join-Path (Get-ImportRootPath) ($name + ".csv")
+            $header = @()
+            if (Test-Path -LiteralPath $path) {
+                $sr = New-Object System.IO.StreamReader($path, [System.Text.Encoding]::UTF8, $true)
+                try {
+                    $hl = $sr.ReadLine()
+                    while ($null -ne $hl -and $hl.Trim().Length -eq 0) { $hl = $sr.ReadLine() }
+                    if (-not [string]::IsNullOrEmpty($hl)) { $header = @(Split-CsvLineFields -Line $hl) }
+                } finally { $sr.Dispose() }
+            }
+            $hdrMap = Get-ImportTableHeaders
+            if ($header.Count -eq 0 -and $hdrMap.ContainsKey($name + ".csv")) {
+                $header = ([string]$hdrMap[$name + ".csv"]).Split(',')
+            }
+            foreach ($c in $header) { [void]$grid.Columns.Add([string]$c, [string]$c) }
+            $rows = @(Import-CsvSafe -Path $path)
+            foreach ($r in $rows) {
+                $vals = @()
+                foreach ($c in $header) { $vals += (Get-FieldString -Object $r -PropertyName ([string]$c)) }
+                [void]$grid.Rows.Add([object[]]$vals)
+            }
+            $ui.Table = $name
+            $ui.Header = @($header)
+            $ui.Dirty = $false
+            $desc = [string]$descMap[$name]
+            $lblInfo.Text = ("{0}.csv — {1}  ({2} 筆)  路徑: {3}" -f $name, $desc, $rows.Count, $path)
+        } catch {
+            Write-ErrorLog ("TableManager load: " + $_.Exception.Message)
+            Show-ErrorMessage ("載入資料表失敗: " + $_.Exception.Message)
+        } finally { $ui.Loading = $false }
+    }.GetNewClosure()
+
+    $saveTable = {
+        try {
+            $name = [string]$ui.Table
+            if ([string]::IsNullOrEmpty($name)) { return }
+            $path = Join-Path (Get-ImportRootPath) ($name + ".csv")
+            $header = @($ui.Header)
+            $lines = New-Object System.Collections.Generic.List[string]
+            $lines.Add((Join-CsvLine $header))
+            $n = 0
+            foreach ($row in $grid.Rows) {
+                if ($row.IsNewRow) { continue }
+                $vals = @()
+                $allEmpty = $true
+                for ($i = 0; $i -lt $header.Count; $i++) {
+                    $v = ""
+                    if ($i -lt $row.Cells.Count -and $null -ne $row.Cells[$i].Value) {
+                        $v = ([string]$row.Cells[$i].Value).Trim()
+                    }
+                    if ($v.Length -gt 0) { $allEmpty = $false }
+                    $vals += $v
+                }
+                if ($allEmpty) { continue }
+                $lines.Add((Join-CsvLine $vals))
+                $n++
+            }
+            Write-FileSafe -Path $path -Text (($lines.ToArray()) -join [Environment]::NewLine)
+            Write-AuditLog -Action "TABLE_EDITED" -Detail ("{0}.csv rows={1}" -f $name, $n)
+            $ui.Dirty = $false
+            $lblInfo.Text = ("{0}.csv — 已儲存 ({1} 筆)  路徑: {2}" -f $name, $n, $path)
+            Show-Info (("已儲存 {0}.csv ({1} 筆)。" -f $name, $n) + [Environment]::NewLine + `
+                "寫檔前版本已自動備份於 Backup\BeforeWrite。" + [Environment]::NewLine + `
+                "請於診斷頁按「重載資料」讓變更生效。")
+        } catch {
+            Write-ErrorLog ("TableManager save: " + $_.Exception.Message)
+            Show-ErrorMessage ("儲存失敗: " + $_.Exception.Message)
+        }
+    }.GetNewClosure()
+
+    $confirmDiscard = {
+        if (-not $ui.Dirty) { return $true }
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+            "目前資料表有未儲存的變更, 繼續將遺失。確定?", "未儲存的變更",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return ($ans -eq [System.Windows.Forms.DialogResult]::Yes)
+    }.GetNewClosure()
+
+    $grid.Add_CellValueChanged({ if (-not $ui.Loading) { $ui.Dirty = $true } }.GetNewClosure())
+    $grid.Add_UserDeletedRow({ if (-not $ui.Loading) { $ui.Dirty = $true } }.GetNewClosure())
+
+    $cbTable.Add_SelectedIndexChanged({
+        try {
+            if ($ui.Switching) { return }
+            if (-not (& $confirmDiscard)) {
+                $ui.Switching = $true
+                $cbTable.SelectedItem = $ui.Table
+                $ui.Switching = $false
+                return
+            }
+            & $loadTable
+        } catch { Write-ErrorLog ("TableManager switch: " + $_.Exception.Message) }
+    }.GetNewClosure())
+
+    $btnSave.Add_Click({ & $saveTable }.GetNewClosure())
+    $btnReloadT.Add_Click({
+        try { if (& $confirmDiscard) { & $loadTable } } catch { Show-ErrorMessage $_.Exception.Message }
+    }.GetNewClosure())
+    $btnFolder.Add_Click({
+        try { Invoke-Item -LiteralPath (Get-ImportRootPath) } catch { Show-ErrorMessage $_.Exception.Message }
+    }.GetNewClosure())
+    $btnColHelp.Add_Click({
+        try {
+            Initialize-ImportTableTemplates | Out-Null
+            Invoke-Item -LiteralPath (Join-Path (Split-Path -Parent (Get-DeidentMapPath)) "資料表欄位說明.txt")
+        } catch { Show-ErrorMessage $_.Exception.Message }
+    }.GetNewClosure())
+    $form.Add_FormClosing({
+        param($s, $e)
+        if (-not (& $confirmDiscard)) { $e.Cancel = $true }
+    }.GetNewClosure())
+
+    $cbTable.SelectedIndex = 0
+    [void]$form.ShowDialog()
+}
+
 function Show-ConfigEditorDialog {
     # 回傳 $true = 已儲存 (Pitfall 4: 以 $form.Tag 傳回結果)
     param([hashtable]$St)
@@ -4447,17 +4651,21 @@ function Build-SettingsTab {
         } catch { Write-ErrorLog ("refreshInfo: " + $_.Exception.Message) }
     }.GetNewClosure()
 
-    $btnDeident = New-UiButton -Text "執行去識別化轉換 (RawImport -> Import)" -X 10 -Y $y -Width 300
+    $btnDeident = New-UiButton -Text "去識別化轉換 (RawImport->Import)" -X 10 -Y $y -Width 250
     $Tab.Controls.Add($btnDeident)
-    $btnOpenImport = New-UiButton -Text "開啟匯入資料夾" -X 320 -Y $y -Width 140
+    $btnTables = New-UiButton -Text "資料表管理 (編輯六張表)" -X 268 -Y $y -Width 180
+    $btnTables.BackColor = [System.Drawing.Color]::FromArgb(142, 68, 173)
+    $btnTables.ForeColor = [System.Drawing.Color]::White
+    $Tab.Controls.Add($btnTables)
+    $btnOpenImport = New-UiButton -Text "開啟匯入資料夾" -X 456 -Y $y -Width 130
     $Tab.Controls.Add($btnOpenImport)
-    $btnOpenLogs = New-UiButton -Text "開啟 Logs" -X 470 -Y $y -Width 110
+    $btnOpenLogs = New-UiButton -Text "開啟 Logs" -X 594 -Y $y -Width 90
     $Tab.Controls.Add($btnOpenLogs)
-    $btnEditCfg = New-UiButton -Text "編輯設定 (Admin)" -X 590 -Y $y -Width 150
+    $btnEditCfg = New-UiButton -Text "編輯設定 (Admin)" -X 692 -Y $y -Width 140
     $btnEditCfg.BackColor = [System.Drawing.Color]::FromArgb(41, 128, 185)
     $btnEditCfg.ForeColor = [System.Drawing.Color]::White
     $Tab.Controls.Add($btnEditCfg)
-    $btnStepMean = New-UiButton -Text "Log 秒檔 StepCode 平均" -X 750 -Y $y -Width 200
+    $btnStepMean = New-UiButton -Text "Log 秒檔 StepCode 平均" -X 840 -Y $y -Width 200
     $Tab.Controls.Add($btnStepMean)
     $y += 44
 
@@ -4635,6 +4843,20 @@ function Build-SettingsTab {
             Show-ErrorMessage ("StepCode 平均計算失敗: " + $_.Exception.Message)
         }
     }.GetNewClosure())
+    $btnTables.Add_Click({
+        try {
+            $u = $St.CurrentUser
+            if ($null -eq $u) { Show-Warn "請先登入。"; return }
+            $role = Get-FieldString -Object $u -PropertyName "Role"
+            if ($role -ne "Admin" -and $role -ne "Engineer") {
+                Show-Warn "僅 Admin / Engineer 可編輯資料表 (Viewer 僅供瀏覽)。"; return
+            }
+            Show-TableManagerDialog -St $St
+        } catch {
+            Write-ErrorLog ("btnTables: " + $_.Exception.Message)
+            Show-ErrorMessage ("資料表管理開啟失敗: " + $_.Exception.Message)
+        }
+    }.GetNewClosure())
     $btnEditCfg.Add_Click({
         try {
             $u = $St.CurrentUser
@@ -4772,7 +4994,7 @@ try {
     Show-ErrorMessage ("系統發生錯誤: " + $_.Exception.Message)
     if ($SelfTest) { exit 1 }
 }
-# EOF RunPreCheckAI.ps1 v1.0.14
+# EOF RunPreCheckAI.ps1 v1.0.15
 
 
 
